@@ -108,8 +108,13 @@ const getPriceHistory = db.prepare(`
 `);
 
 // ===== EMAIL TRANSPORT =====
+// Priority: RESEND_API_KEY (HTTP API, works on Railway) > SMTP (may be blocked)
+const RESEND_API_KEY = process.env.RESEND_API_KEY || null;
 let transporter = null;
-if (process.env.SMTP_HOST) {
+
+if (RESEND_API_KEY) {
+  console.log('[Email] Resend API configured (HTTP-based, no SMTP needed)');
+} else if (process.env.SMTP_HOST) {
   transporter = nodemailer.createTransport({
     host: process.env.SMTP_HOST,
     port: parseInt(process.env.SMTP_PORT) || 587,
@@ -121,7 +126,29 @@ if (process.env.SMTP_HOST) {
   });
   console.log('[Email] SMTP transport configured: ' + process.env.SMTP_HOST);
 } else {
-  console.log('[Email] WARNING: No SMTP configured. Emails will be logged only.');
+  console.log('[Email] WARNING: No email configured. Emails will be logged only.');
+}
+
+// Send email via Resend HTTP API
+async function sendViaResend(to, subject, html) {
+  const resp = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${RESEND_API_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      from: process.env.EMAIL_FROM || 'ZebraTur <onboarding@resend.dev>',
+      to: [to],
+      subject: subject,
+      html: html
+    })
+  });
+  const data = await resp.json();
+  if (!resp.ok) {
+    throw new Error(data.message || JSON.stringify(data));
+  }
+  return data;
 }
 
 const AGENCY = {
@@ -197,7 +224,14 @@ async function sendPriceAlert(watcher, oldPrice, newPrice, changePct) {
     </div>
   `;
 
-  if (transporter) {
+  if (RESEND_API_KEY) {
+    try {
+      await sendViaResend(watcher.email, subject, html);
+      console.log(`[Email] Sent via Resend to ${watcher.email}: ${subject}`);
+    } catch (err) {
+      console.error(`[Email] Resend failed for ${watcher.email}:`, err.message);
+    }
+  } else if (transporter) {
     try {
       await transporter.sendMail({
         from: process.env.EMAIL_FROM || `${AGENCY.name} <noreply@zebratur.md>`,
@@ -205,9 +239,9 @@ async function sendPriceAlert(watcher, oldPrice, newPrice, changePct) {
         subject: subject,
         html: html
       });
-      console.log(`[Email] Sent to ${watcher.email}: ${subject}`);
+      console.log(`[Email] Sent via SMTP to ${watcher.email}: ${subject}`);
     } catch (err) {
-      console.error(`[Email] Failed to send to ${watcher.email}:`, err.message);
+      console.error(`[Email] SMTP failed for ${watcher.email}:`, err.message);
     }
   } else {
     console.log(`[Email] (no SMTP) Would send to ${watcher.email}: ${subject}`);
