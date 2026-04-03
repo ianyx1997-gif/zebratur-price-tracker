@@ -322,14 +322,6 @@ async function checkAllPrices() {
       const oldPrice = watcher.current_price;
       const changePct = ((newPrice - oldPrice) / oldPrice) * 100;
 
-      // FIRST CHECK after subscription: set the real API price as baseline, NO alert
-      // last_checked is NULL when the watcher has never been checked by cron before
-      if (!watcher.last_checked) {
-        console.log(`[PriceCheck] First check for watcher ${watcher.id} (${watcher.email}), setting baseline: ${newPrice} (was ${oldPrice})`);
-        updateWatcherPrice.run(newPrice, watcher.id);
-        continue; // Skip alerting on first check
-      }
-
       // Update current price in DB
       updateWatcherPrice.run(newPrice, watcher.id);
 
@@ -381,7 +373,7 @@ app.get('/', (req, res) => {
 });
 
 // Subscribe to price tracking
-app.post('/api/watch', (req, res) => {
+app.post('/api/watch', async (req, res) => {
   try {
     const { email, tourId, tourName, tourUrl, tourImg, price, currency, geo, dates, stars, food } = req.body;
 
@@ -399,13 +391,26 @@ app.post('/api/watch', (req, res) => {
       return res.status(400).json({ error: 'Invalid price' });
     }
 
+    // Fetch the REAL API price immediately to use as baseline
+    // This avoids false alerts from widget price vs API price mismatch
+    let baselinePrice = numPrice;
+    try {
+      const apiPrice = await fetchCurrentPrice(tourUrl || null, tourId);
+      if (apiPrice && apiPrice > 0) {
+        baselinePrice = apiPrice;
+        console.log(`[Watch] API baseline for hotel ${tourId}: ${apiPrice} (widget showed ${numPrice})`);
+      }
+    } catch (err) {
+      console.log(`[Watch] Could not fetch API price for ${tourId}, using widget price: ${numPrice}`);
+    }
+
     insertWatcher.run(
       email, tourId, tourName || null, tourUrl || null, tourImg || null,
-      numPrice, numPrice, currency || 'USD',
+      numPrice, baselinePrice, currency || 'USD',
       geo || null, dates || null, stars ? parseInt(stars) : null, food || null
     );
 
-    console.log(`[Watch] ${email} now watching tour ${tourId} at ${numPrice} ${currency || 'USD'}`);
+    console.log(`[Watch] ${email} now watching tour ${tourId} at baseline ${baselinePrice} ${currency || 'USD'} (widget: ${numPrice})`);
 
     res.json({
       success: true,
