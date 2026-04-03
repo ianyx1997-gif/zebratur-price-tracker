@@ -219,50 +219,43 @@ async function sendPriceAlert(watcher, oldPrice, newPrice, changePct) {
 }
 
 // ===== FETCH CURRENT PRICE FOR A TOUR =====
-// This function tries to get the current price from the tour URL.
-// Adapt based on how Otpusk provides pricing data.
+// Uses the Otpusk API v2.4 hotel endpoint with minoffer data
+const OTPUSK_TOKEN = process.env.OTPUSK_ACCESS_TOKEN || '3834b-187cb-0bad1-61bd5-28f3f';
+
 async function fetchCurrentPrice(tourUrl, tourId) {
   try {
-    // Method 1: Try Otpusk API if tour_id looks like an otpusk ID
-    if (tourId && /^\d+$/.test(tourId)) {
-      const apiUrl = `https://export.otpusk.com/api/tour?id=${tourId}&format=json`;
-      const resp = await fetch(apiUrl, {
-        headers: { 'User-Agent': 'ZebraTur-PriceTracker/1.0' },
-        timeout: 15000
-      });
-      if (resp.ok) {
-        const data = await resp.json();
-        if (data && data.price) {
-          return parseFloat(data.price);
-        }
-      }
+    if (!tourId || !/^\d+$/.test(tourId)) {
+      console.log(`[PriceCheck] Invalid tourId: ${tourId}`);
+      return null;
     }
 
-    // Method 2: Scrape the tour page for price data
-    if (tourUrl) {
-      const resp = await fetch(tourUrl, {
-        headers: { 'User-Agent': 'ZebraTur-PriceTracker/1.0' },
-        timeout: 15000
-      });
-      if (resp.ok) {
-        const html = await resp.text();
-        // Look for price patterns in the HTML
-        // Pattern: "price":123 or data-price="123" or class="price">$123
-        const patterns = [
-          /"price"\s*:\s*(\d+(?:\.\d+)?)/,
-          /data-price="(\d+(?:\.\d+)?)"/,
-          /price[^>]*>[\s$€]*(\d[\d\s,.]*)/i
-        ];
-        for (const pattern of patterns) {
-          const match = html.match(pattern);
-          if (match) {
-            const price = parseFloat(match[1].replace(/[\s,]/g, ''));
-            if (price > 0) return price;
-          }
-        }
-      }
+    const apiUrl = `https://api.otpusk.com/api/2.4/tours/hotel/?hotelId=${tourId}&data=minoffer&lang=ro&access_token=${OTPUSK_TOKEN}`;
+    console.log(`[PriceCheck] Fetching: ${apiUrl}`);
+
+    const resp = await fetch(apiUrl, {
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (compatible; ZebraTur-PriceTracker/1.0)'
+      },
+      timeout: 15000
+    });
+
+    if (!resp.ok) {
+      console.log(`[PriceCheck] API returned ${resp.status} for hotel ${tourId}`);
+      return null;
     }
 
+    const data = await resp.json();
+
+    // Price is at hotel.p.p (minoffer price), currency at hotel.p.c
+    if (data && data.hotel && data.hotel.p && data.hotel.p.p) {
+      const price = parseFloat(data.hotel.p.p);
+      const currency = data.hotel.p.c || 'eur';
+      console.log(`[PriceCheck] Hotel ${tourId} (${data.hotel.nm || tourId}): ${price} ${currency}`);
+      return price;
+    }
+
+    console.log(`[PriceCheck] No minoffer price found for hotel ${tourId}`);
     return null;
   } catch (err) {
     console.error(`[PriceCheck] Error fetching price for tour ${tourId}:`, err.message);
