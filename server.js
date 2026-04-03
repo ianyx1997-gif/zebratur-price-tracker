@@ -322,6 +322,14 @@ async function checkAllPrices() {
       const oldPrice = watcher.current_price;
       const changePct = ((newPrice - oldPrice) / oldPrice) * 100;
 
+      // FIRST CHECK after subscription: set the real API price as baseline, NO alert
+      // last_checked is NULL when the watcher has never been checked by cron before
+      if (!watcher.last_checked) {
+        console.log(`[PriceCheck] First check for watcher ${watcher.id} (${watcher.email}), setting baseline: ${newPrice} (was ${oldPrice})`);
+        updateWatcherPrice.run(newPrice, watcher.id);
+        continue; // Skip alerting on first check
+      }
+
       // Update current price in DB
       updateWatcherPrice.run(newPrice, watcher.id);
 
