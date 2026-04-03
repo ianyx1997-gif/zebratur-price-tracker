@@ -48,6 +48,7 @@ db.exec(`
     dates TEXT,
     stars INTEGER,
     food TEXT,
+    search_params TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     last_checked DATETIME,
     last_notified DATETIME,
@@ -73,10 +74,18 @@ db.exec(`
   );
 `);
 
+// Migration: add search_params column if missing
+try {
+  db.exec(`ALTER TABLE watchers ADD COLUMN search_params TEXT`);
+  console.log('[DB] Added search_params column');
+} catch(e) {
+  // Column already exists
+}
+
 // Prepared statements
 const insertWatcher = db.prepare(`
-  INSERT OR REPLACE INTO watchers (email, tour_id, tour_name, tour_url, tour_img, initial_price, current_price, currency, geo, dates, stars, food)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT OR REPLACE INTO watchers (email, tour_id, tour_name, tour_url, tour_img, initial_price, current_price, currency, geo, dates, stars, food, search_params)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const getActiveWatchers = db.prepare(`SELECT * FROM watchers WHERE active = 1`);
@@ -252,96 +261,273 @@ async function sendPriceAlert(watcher, oldPrice, newPrice, changePct) {
   markNotified.run(watcher.id);
 }
 
-// ===== FETCH CURRENT PRICE FOR A TOUR =====
-// Uses the Otpusk API v2.4 hotel endpoint with minoffer data
+// ===== FETCH PRICES VIA OTPUSK v2.5 SEARCH API =====
+// This uses the SAME API as the Otpusk widget, so prices match exactly
 const OTPUSK_TOKEN = process.env.OTPUSK_ACCESS_TOKEN || '3834b-187cb-0bad1-61bd5-28f3f';
 
-async function fetchCurrentPrice(tourUrl, tourId) {
-  try {
-    if (!tourId || !/^\d+$/.test(tourId)) {
-      console.log(`[PriceCheck] Invalid tourId: ${tourId}`);
-      return null;
+// Poll the async search API until lastResult=true, return hotel prices map
+async function searchPrices(searchParams) {
+  const sp = searchParams;
+  if (!sp || !sp.countryId || !sp.checkIn) {
+    console.log('[Search] Missing search params, cannot search');
+    return null;
+  }
+
+  const params = new URLSearchParams({
+    to: sp.countryId,
+    checkIn: sp.checkIn,
+    checkTo: sp.checkTo || sp.checkIn,
+    length: sp.length || '7',
+    lengthTo: sp.lengthTo || '',
+    people: sp.people || '2',
+    transport: sp.transport || 'air',
+    number: '0',
+    page: '1',
+    deptCity: sp.deptCity || '1831',
+    lang: 'ro',
+    group: '5',
+    currencyLocal: sp.currencyLocal || 'eur',
+    currency: '',
+    access_token: OTPUSK_TOKEN
+  });
+
+  // Optional filters
+  if (sp.food) params.set('food', sp.food);
+  if (sp.stars) params.set('stars', sp.stars);
+  if (sp.price) params.set('price', sp.price);
+  if (sp.priceTo) params.set('priceTo', sp.priceTo);
+
+  const searchUrl = `https://api.otpusk.com/api/2.5/tours/search/?${params.toString()}`;
+  console.log(`[Search] Starting: countryId=${sp.countryId}, checkIn=${sp.checkIn}, checkTo=${sp.checkTo}, deptCity=${sp.deptCity}`);
+
+  // Poll up to 12 times (60 seconds total)
+  const maxPolls = 12;
+  const pollInterval = 5000; // 5 seconds
+
+  for (let attempt = 0; attempt < maxPolls; attempt++) {
+    try {
+      const resp = await fetch(searchUrl, {
+        headers: {
+          'Accept': 'application/json',
+          'User-Agent': 'Mozilla/5.0 (compatible; ZebraTur-PriceTracker/1.0)'
+        }
+      });
+
+      if (!resp.ok) {
+        console.log(`[Search] API returned ${resp.status}, attempt ${attempt + 1}`);
+        await new Promise(r => setTimeout(r, pollInterval));
+        continue;
+      }
+
+      const data = await resp.json();
+
+      if (data.lastResult) {
+        // Search complete! Extract hotel prices
+        const hotelPrices = {};
+        if (data.hotels) {
+          // Hotels are grouped by page: data.hotels["1"] = { hotelId: {...}, ... }
+          for (const pageKey of Object.keys(data.hotels)) {
+            const page = data.hotels[pageKey];
+            if (page && typeof page === 'object') {
+              for (const hotelId of Object.keys(page)) {
+                const hotel = page[hotelId];
+                if (hotel && hotel.p) {
+                  hotelPrices[hotelId] = {
+                    price: parseFloat(hotel.p),
+                    currency: hotel.pu || 'eur',
+                    name: hotel.n || hotel.ohn || hotelId
+                  };
+                }
+              }
+            }
+          }
+        }
+        console.log(`[Search] Complete: ${Object.keys(hotelPrices).length} hotels found, ${data.total} total offers`);
+        return hotelPrices;
+      }
+
+      // Not ready yet, log progress
+      const progress = data.progress || {};
+      const done = Object.values(progress).filter(v => v === true).length;
+      const total = Object.keys(progress).length;
+      console.log(`[Search] Poll ${attempt + 1}/${maxPolls}: ${done}/${total} operators done, ${data._persent || 0}%`);
+
+      // Already got some partial results — extract them too on last poll
+      if (attempt === maxPolls - 1 && data.hotels) {
+        const hotelPrices = {};
+        for (const pageKey of Object.keys(data.hotels)) {
+          const page = data.hotels[pageKey];
+          if (page && typeof page === 'object') {
+            for (const hotelId of Object.keys(page)) {
+              const hotel = page[hotelId];
+              if (hotel && hotel.p) {
+                hotelPrices[hotelId] = {
+                  price: parseFloat(hotel.p),
+                  currency: hotel.pu || 'eur',
+                  name: hotel.n || hotel.ohn || hotelId
+                };
+              }
+            }
+          }
+        }
+        if (Object.keys(hotelPrices).length > 0) {
+          console.log(`[Search] Timeout but got partial results: ${Object.keys(hotelPrices).length} hotels`);
+          return hotelPrices;
+        }
+      }
+
+      await new Promise(r => setTimeout(r, pollInterval));
+    } catch (err) {
+      console.error(`[Search] Error on poll ${attempt + 1}:`, err.message);
+      await new Promise(r => setTimeout(r, pollInterval));
     }
+  }
 
+  console.log('[Search] Timed out after all polls');
+  return null;
+}
+
+// Fallback: use minoffer API for watchers without search params
+async function fetchMinofferPrice(tourId) {
+  try {
+    if (!tourId || !/^\d+$/.test(tourId)) return null;
     const apiUrl = `https://api.otpusk.com/api/2.4/tours/hotel/?hotelId=${tourId}&data=minoffer&lang=ro&access_token=${OTPUSK_TOKEN}`;
-    console.log(`[PriceCheck] Fetching: ${apiUrl}`);
-
     const resp = await fetch(apiUrl, {
-      headers: {
-        'Accept': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (compatible; ZebraTur-PriceTracker/1.0)'
-      },
+      headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0 (compatible; ZebraTur-PriceTracker/1.0)' },
       timeout: 15000
     });
-
-    if (!resp.ok) {
-      console.log(`[PriceCheck] API returned ${resp.status} for hotel ${tourId}`);
-      return null;
-    }
-
+    if (!resp.ok) return null;
     const data = await resp.json();
-
-    // Price is at hotel.p.p (minoffer price), currency at hotel.p.c
     if (data && data.hotel && data.hotel.p && data.hotel.p.p) {
-      const price = parseFloat(data.hotel.p.p);
-      const currency = data.hotel.p.c || 'eur';
-      console.log(`[PriceCheck] Hotel ${tourId} (${data.hotel.nm || tourId}): ${price} ${currency}`);
-      return price;
+      return parseFloat(data.hotel.p.p);
     }
-
-    console.log(`[PriceCheck] No minoffer price found for hotel ${tourId}`);
     return null;
   } catch (err) {
-    console.error(`[PriceCheck] Error fetching price for tour ${tourId}:`, err.message);
+    console.error(`[Minoffer] Error for hotel ${tourId}:`, err.message);
     return null;
   }
 }
 
 // ===== PRICE CHECK JOB =====
 async function checkAllPrices() {
-  console.log('[PriceCheck] Starting hourly price check...');
+  console.log('[PriceCheck] Starting price check...');
   const watchers = getActiveWatchers.all();
   console.log(`[PriceCheck] Checking ${watchers.length} active watchers`);
 
   let checked = 0, alerts = 0;
 
-  for (const watcher of watchers) {
-    try {
-      const newPrice = await fetchCurrentPrice(watcher.tour_url, watcher.tour_id);
+  // Group watchers by search params to batch API calls
+  const searchGroups = {}; // key = JSON search params, value = [watchers]
+  const noSearchWatchers = []; // watchers without search params (use minoffer fallback)
 
-      if (newPrice === null || newPrice <= 0) {
-        console.log(`[PriceCheck] Could not get price for tour ${watcher.tour_id}, skipping`);
+  for (const watcher of watchers) {
+    if (watcher.search_params) {
+      try {
+        const sp = JSON.parse(watcher.search_params);
+        // Create a group key from the search params that matter
+        const key = JSON.stringify({
+          countryId: sp.countryId,
+          checkIn: sp.checkIn,
+          checkTo: sp.checkTo,
+          length: sp.length,
+          lengthTo: sp.lengthTo,
+          deptCity: sp.deptCity || '1831',
+          people: sp.people || '2',
+          food: sp.food || '',
+          stars: sp.stars || '',
+          transport: sp.transport || 'air'
+        });
+        if (!searchGroups[key]) searchGroups[key] = { params: sp, watchers: [] };
+        searchGroups[key].watchers.push(watcher);
+      } catch (e) {
+        noSearchWatchers.push(watcher);
+      }
+    } else {
+      noSearchWatchers.push(watcher);
+    }
+  }
+
+  console.log(`[PriceCheck] ${Object.keys(searchGroups).length} search groups, ${noSearchWatchers.length} minoffer fallbacks`);
+
+  // Process each search group (one API search per group)
+  for (const groupKey of Object.keys(searchGroups)) {
+    const group = searchGroups[groupKey];
+    try {
+      const hotelPrices = await searchPrices(group.params);
+      if (!hotelPrices) {
+        console.log(`[PriceCheck] Search returned no results for group`);
         continue;
       }
 
-      checked++;
+      for (const watcher of group.watchers) {
+        try {
+          const hotelData = hotelPrices[watcher.tour_id];
+          if (!hotelData) {
+            console.log(`[PriceCheck] Hotel ${watcher.tour_id} not in search results, skipping`);
+            continue;
+          }
 
-      // Record price history
+          const newPrice = hotelData.price;
+          if (!newPrice || newPrice <= 0) continue;
+
+          checked++;
+          insertPriceHistory.run(watcher.tour_id, newPrice);
+
+          const oldPrice = watcher.current_price;
+          const changePct = ((newPrice - oldPrice) / oldPrice) * 100;
+
+          updateWatcherPrice.run(newPrice, watcher.id);
+
+          console.log(`[PriceCheck] Hotel ${watcher.tour_id} (${watcher.tour_name}): ${oldPrice} -> ${newPrice} (${changePct > 0 ? '+' : ''}${changePct.toFixed(1)}%)`);
+
+          if (Math.abs(changePct) >= THRESHOLD) {
+            if (watcher.last_notified) {
+              const lastNotif = new Date(watcher.last_notified).getTime();
+              const twelveHoursAgo = Date.now() - (12 * 60 * 60 * 1000);
+              if (lastNotif > twelveHoursAgo) {
+                console.log(`[PriceCheck] Skipping notification for ${watcher.email} (notified recently)`);
+                continue;
+              }
+            }
+            await sendPriceAlert(watcher, oldPrice, newPrice, changePct);
+            alerts++;
+          }
+        } catch (err) {
+          console.error(`[PriceCheck] Error processing watcher ${watcher.id}:`, err.message);
+        }
+      }
+
+      // Small delay between search groups to avoid rate limiting
+      await new Promise(r => setTimeout(r, 2000));
+    } catch (err) {
+      console.error(`[PriceCheck] Error with search group:`, err.message);
+    }
+  }
+
+  // Process watchers without search params (minoffer fallback)
+  for (const watcher of noSearchWatchers) {
+    try {
+      const newPrice = await fetchMinofferPrice(watcher.tour_id);
+      if (newPrice === null || newPrice <= 0) continue;
+
+      checked++;
       insertPriceHistory.run(watcher.tour_id, newPrice);
 
       const oldPrice = watcher.current_price;
       const changePct = ((newPrice - oldPrice) / oldPrice) * 100;
-
-      // Update current price in DB
       updateWatcherPrice.run(newPrice, watcher.id);
 
-      // Check if change exceeds threshold
       if (Math.abs(changePct) >= THRESHOLD) {
-        // Don't notify if we already notified in the last 12 hours
         if (watcher.last_notified) {
           const lastNotif = new Date(watcher.last_notified).getTime();
           const twelveHoursAgo = Date.now() - (12 * 60 * 60 * 1000);
-          if (lastNotif > twelveHoursAgo) {
-            console.log(`[PriceCheck] Skipping notification for ${watcher.email} (already notified recently)`);
-            continue;
-          }
+          if (lastNotif > twelveHoursAgo) continue;
         }
-
         await sendPriceAlert(watcher, oldPrice, newPrice, changePct);
         alerts++;
       }
     } catch (err) {
-      console.error(`[PriceCheck] Error processing watcher ${watcher.id}:`, err.message);
+      console.error(`[PriceCheck] Minoffer error for watcher ${watcher.id}:`, err.message);
     }
   }
 
@@ -349,7 +535,8 @@ async function checkAllPrices() {
 }
 
 // ===== CRON SCHEDULE =====
-const intervalMinutes = parseInt(process.env.CHECK_INTERVAL_MINUTES) || 1;
+// Search API is async + heavy — check every 30 min by default (not every minute)
+const intervalMinutes = parseInt(process.env.CHECK_INTERVAL_MINUTES) || 30;
 const cronExpr = intervalMinutes >= 60
   ? `0 */${Math.floor(intervalMinutes / 60)} * * *`
   : `*/${intervalMinutes} * * * *`;
@@ -375,13 +562,12 @@ app.get('/', (req, res) => {
 // Subscribe to price tracking
 app.post('/api/watch', async (req, res) => {
   try {
-    const { email, tourId, tourName, tourUrl, tourImg, price, currency, geo, dates, stars, food } = req.body;
+    const { email, tourId, tourName, tourUrl, tourImg, price, currency, geo, dates, stars, food, searchParams } = req.body;
 
     if (!email || !tourId || !price) {
       return res.status(400).json({ error: 'Email, tourId, and price are required' });
     }
 
-    // Basic email validation
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       return res.status(400).json({ error: 'Invalid email address' });
     }
@@ -391,26 +577,27 @@ app.post('/api/watch', async (req, res) => {
       return res.status(400).json({ error: 'Invalid price' });
     }
 
-    // Fetch the REAL API price immediately to use as baseline
-    // This avoids false alerts from widget price vs API price mismatch
-    let baselinePrice = numPrice;
-    try {
-      const apiPrice = await fetchCurrentPrice(tourUrl || null, tourId);
-      if (apiPrice && apiPrice > 0) {
-        baselinePrice = apiPrice;
-        console.log(`[Watch] API baseline for hotel ${tourId}: ${apiPrice} (widget showed ${numPrice})`);
-      }
-    } catch (err) {
-      console.log(`[Watch] Could not fetch API price for ${tourId}, using widget price: ${numPrice}`);
+    // Use widget price directly as baseline — the search API returns the same prices
+    // No more minoffer mismatch!
+    const baselinePrice = numPrice;
+
+    // Store search params so we can replay the same search server-side
+    let searchParamsJson = null;
+    if (searchParams && typeof searchParams === 'object' && searchParams.countryId) {
+      searchParamsJson = JSON.stringify(searchParams);
+      console.log(`[Watch] Search params captured: country=${searchParams.countryId}, checkIn=${searchParams.checkIn}, deptCity=${searchParams.deptCity}`);
+    } else {
+      console.log(`[Watch] WARNING: No search params provided for hotel ${tourId} — will use minoffer fallback`);
     }
 
     insertWatcher.run(
       email, tourId, tourName || null, tourUrl || null, tourImg || null,
       numPrice, baselinePrice, currency || 'USD',
-      geo || null, dates || null, stars ? parseInt(stars) : null, food || null
+      geo || null, dates || null, stars ? parseInt(stars) : null, food || null,
+      searchParamsJson
     );
 
-    console.log(`[Watch] ${email} now watching tour ${tourId} at baseline ${baselinePrice} ${currency || 'USD'} (widget: ${numPrice})`);
+    console.log(`[Watch] ${email} now watching hotel ${tourId} at ${baselinePrice} ${currency || 'EUR'}`);
 
     res.json({
       success: true,
