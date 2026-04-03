@@ -265,7 +265,8 @@ async function sendPriceAlert(watcher, oldPrice, newPrice, changePct) {
 // This uses the SAME API as the Otpusk widget, so prices match exactly
 const OTPUSK_TOKEN = process.env.OTPUSK_ACCESS_TOKEN || '3834b-187cb-0bad1-61bd5-28f3f';
 
-// Poll the async search API until lastResult=true, return hotel prices map
+// Poll the async search API until lastResult=true, then fetch ALL pages
+// Returns a map of hotelId -> { price, currency, name }
 async function searchPrices(searchParams) {
   const sp = searchParams;
   if (!sp || !sp.countryId || !sp.checkIn) {
@@ -273,118 +274,134 @@ async function searchPrices(searchParams) {
     return null;
   }
 
-  const params = new URLSearchParams({
-    to: sp.countryId,
-    checkIn: sp.checkIn,
-    checkTo: sp.checkTo || sp.checkIn,
-    length: sp.length || '7',
-    lengthTo: sp.lengthTo || '',
-    people: sp.people || '2',
-    transport: sp.transport || 'air',
-    number: '0',
-    page: '1',
-    deptCity: sp.deptCity || '1831',
-    lang: 'ro',
-    group: '5',
-    currencyLocal: sp.currencyLocal || 'eur',
-    currency: '',
-    access_token: OTPUSK_TOKEN
-  });
+  const buildParams = (pageNum) => {
+    const params = new URLSearchParams({
+      to: sp.countryId,
+      checkIn: sp.checkIn,
+      checkTo: sp.checkTo || sp.checkIn,
+      length: sp.length || '7',
+      lengthTo: sp.lengthTo || '',
+      people: sp.people || '2',
+      transport: sp.transport || 'air',
+      number: '0',
+      page: String(pageNum),
+      deptCity: sp.deptCity || '1831',
+      lang: 'ro',
+      group: '5',
+      currencyLocal: sp.currencyLocal || 'eur',
+      currency: '',
+      access_token: OTPUSK_TOKEN
+    });
+    if (sp.food) params.set('food', sp.food);
+    if (sp.stars) params.set('stars', sp.stars);
+    if (sp.price) params.set('price', sp.price);
+    if (sp.priceTo) params.set('priceTo', sp.priceTo);
+    return params;
+  };
 
-  // Optional filters
-  if (sp.food) params.set('food', sp.food);
-  if (sp.stars) params.set('stars', sp.stars);
-  if (sp.price) params.set('price', sp.price);
-  if (sp.priceTo) params.set('priceTo', sp.priceTo);
-
-  const searchUrl = `https://api.otpusk.com/api/2.5/tours/search/?${params.toString()}`;
   console.log(`[Search] Starting: countryId=${sp.countryId}, checkIn=${sp.checkIn}, checkTo=${sp.checkTo}, deptCity=${sp.deptCity}`);
 
-  // Poll up to 12 times (60 seconds total)
-  const maxPolls = 12;
-  const pollInterval = 5000; // 5 seconds
-
-  for (let attempt = 0; attempt < maxPolls; attempt++) {
-    try {
-      const resp = await fetch(searchUrl, {
-        headers: {
-          'Accept': 'application/json',
-          'User-Agent': 'Mozilla/5.0 (compatible; ZebraTur-PriceTracker/1.0)'
+  // Helper: extract hotels from response data
+  function extractHotels(data) {
+    const hotelPrices = {};
+    if (data.hotels) {
+      for (const pageKey of Object.keys(data.hotels)) {
+        const page = data.hotels[pageKey];
+        if (page && typeof page === 'object') {
+          for (const hotelId of Object.keys(page)) {
+            const hotel = page[hotelId];
+            if (hotel && hotel.p) {
+              hotelPrices[hotelId] = {
+                price: parseFloat(hotel.p),
+                currency: hotel.pu || 'eur',
+                name: hotel.n || hotel.ohn || hotelId
+              };
+            }
+          }
         }
-      });
+      }
+    }
+    return hotelPrices;
+  }
 
-      if (!resp.ok) {
-        console.log(`[Search] API returned ${resp.status}, attempt ${attempt + 1}`);
+  // Helper: poll one page until lastResult=true
+  async function pollPage(pageNum) {
+    const params = buildParams(pageNum);
+    const searchUrl = `https://api.otpusk.com/api/2.5/tours/search/?${params.toString()}`;
+    const maxPolls = 12;
+    const pollInterval = 5000;
+
+    for (let attempt = 0; attempt < maxPolls; attempt++) {
+      try {
+        const resp = await fetch(searchUrl, {
+          headers: {
+            'Accept': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (compatible; ZebraTur-PriceTracker/1.0)'
+          }
+        });
+
+        if (!resp.ok) {
+          console.log(`[Search] Page ${pageNum}: API returned ${resp.status}, attempt ${attempt + 1}`);
+          await new Promise(r => setTimeout(r, pollInterval));
+          continue;
+        }
+
+        const data = await resp.json();
+
+        if (data.lastResult) {
+          const hotels = extractHotels(data);
+          const totalOffers = data.total || 0;
+          console.log(`[Search] Page ${pageNum} complete: ${Object.keys(hotels).length} hotels, ${totalOffers} total offers`);
+          return { hotels, totalOffers };
+        }
+
+        // Not ready yet
+        const progress = data.progress || {};
+        const done = Object.values(progress).filter(v => v === true).length;
+        const total = Object.keys(progress).length;
+        if (pageNum === 1) {
+          console.log(`[Search] Poll ${attempt + 1}/${maxPolls}: ${done}/${total} operators done, ${data._persent || 0}%`);
+        }
+
+        // On last poll, extract partial results
+        if (attempt === maxPolls - 1 && data.hotels) {
+          const hotels = extractHotels(data);
+          if (Object.keys(hotels).length > 0) {
+            console.log(`[Search] Page ${pageNum} timeout, partial: ${Object.keys(hotels).length} hotels`);
+            return { hotels, totalOffers: data.total || 0 };
+          }
+        }
+
         await new Promise(r => setTimeout(r, pollInterval));
-        continue;
+      } catch (err) {
+        console.error(`[Search] Page ${pageNum} error on poll ${attempt + 1}:`, err.message);
+        await new Promise(r => setTimeout(r, pollInterval));
       }
+    }
+    return { hotels: {}, totalOffers: 0 };
+  }
 
-      const data = await resp.json();
+  // Fetch page 1
+  const page1 = await pollPage(1);
+  const allHotels = { ...page1.hotels };
+  const hotelsPerPage = 20; // Otpusk returns ~20 hotels per page
+  const maxPages = parseInt(process.env.SEARCH_MAX_PAGES) || 5;
 
-      if (data.lastResult) {
-        // Search complete! Extract hotel prices
-        const hotelPrices = {};
-        if (data.hotels) {
-          // Hotels are grouped by page: data.hotels["1"] = { hotelId: {...}, ... }
-          for (const pageKey of Object.keys(data.hotels)) {
-            const page = data.hotels[pageKey];
-            if (page && typeof page === 'object') {
-              for (const hotelId of Object.keys(page)) {
-                const hotel = page[hotelId];
-                if (hotel && hotel.p) {
-                  hotelPrices[hotelId] = {
-                    price: parseFloat(hotel.p),
-                    currency: hotel.pu || 'eur',
-                    name: hotel.n || hotel.ohn || hotelId
-                  };
-                }
-              }
-            }
-          }
-        }
-        console.log(`[Search] Complete: ${Object.keys(hotelPrices).length} hotels found, ${data.total} total offers`);
-        return hotelPrices;
-      }
+  // Calculate how many more pages to fetch
+  const totalPages = Math.min(Math.ceil(page1.totalOffers / hotelsPerPage), maxPages);
 
-      // Not ready yet, log progress
-      const progress = data.progress || {};
-      const done = Object.values(progress).filter(v => v === true).length;
-      const total = Object.keys(progress).length;
-      console.log(`[Search] Poll ${attempt + 1}/${maxPolls}: ${done}/${total} operators done, ${data._persent || 0}%`);
-
-      // Already got some partial results — extract them too on last poll
-      if (attempt === maxPolls - 1 && data.hotels) {
-        const hotelPrices = {};
-        for (const pageKey of Object.keys(data.hotels)) {
-          const page = data.hotels[pageKey];
-          if (page && typeof page === 'object') {
-            for (const hotelId of Object.keys(page)) {
-              const hotel = page[hotelId];
-              if (hotel && hotel.p) {
-                hotelPrices[hotelId] = {
-                  price: parseFloat(hotel.p),
-                  currency: hotel.pu || 'eur',
-                  name: hotel.n || hotel.ohn || hotelId
-                };
-              }
-            }
-          }
-        }
-        if (Object.keys(hotelPrices).length > 0) {
-          console.log(`[Search] Timeout but got partial results: ${Object.keys(hotelPrices).length} hotels`);
-          return hotelPrices;
-        }
-      }
-
-      await new Promise(r => setTimeout(r, pollInterval));
-    } catch (err) {
-      console.error(`[Search] Error on poll ${attempt + 1}:`, err.message);
-      await new Promise(r => setTimeout(r, pollInterval));
+  if (totalPages > 1) {
+    console.log(`[Search] Fetching ${totalPages - 1} more pages (total offers: ${page1.totalOffers})`);
+    for (let p = 2; p <= totalPages; p++) {
+      const pageResult = await pollPage(p);
+      Object.assign(allHotels, pageResult.hotels);
+      // Small delay between pages
+      await new Promise(r => setTimeout(r, 1000));
     }
   }
 
-  console.log('[Search] Timed out after all polls');
-  return null;
+  console.log(`[Search] All pages done: ${Object.keys(allHotels).length} unique hotels total`);
+  return Object.keys(allHotels).length > 0 ? allHotels : null;
 }
 
 // Fallback: use minoffer API for watchers without search params
@@ -483,9 +500,9 @@ async function checkAllPrices() {
           if (Math.abs(changePct) >= THRESHOLD) {
             if (watcher.last_notified) {
               const lastNotif = new Date(watcher.last_notified).getTime();
-              const twelveHoursAgo = Date.now() - (12 * 60 * 60 * 1000);
-              if (lastNotif > twelveHoursAgo) {
-                console.log(`[PriceCheck] Skipping notification for ${watcher.email} (notified recently)`);
+              const cooldownMs = (parseInt(process.env.NOTIFICATION_COOLDOWN_MINUTES) || 5) * 60 * 1000;
+              if (lastNotif > Date.now() - cooldownMs) {
+                console.log(`[PriceCheck] Skipping notification for ${watcher.email} (notified recently, cooldown ${cooldownMs/60000}min)`);
                 continue;
               }
             }
@@ -520,8 +537,8 @@ async function checkAllPrices() {
       if (Math.abs(changePct) >= THRESHOLD) {
         if (watcher.last_notified) {
           const lastNotif = new Date(watcher.last_notified).getTime();
-          const twelveHoursAgo = Date.now() - (12 * 60 * 60 * 1000);
-          if (lastNotif > twelveHoursAgo) continue;
+          const cooldownMs = (parseInt(process.env.NOTIFICATION_COOLDOWN_MINUTES) || 5) * 60 * 1000;
+          if (lastNotif > Date.now() - cooldownMs) continue;
         }
         await sendPriceAlert(watcher, oldPrice, newPrice, changePct);
         alerts++;
