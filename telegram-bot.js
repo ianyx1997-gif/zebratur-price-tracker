@@ -116,9 +116,12 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
     );
   `);
 
-  // Migration: add tour_id and tour_name columns for specific hotel tracking
+  // Migration: add columns for specific hotel tracking (like email watchers table)
   try { db.exec(`ALTER TABLE telegram_alerts ADD COLUMN tour_id TEXT`); console.log('[Telegram DB] Added tour_id column'); } catch(e) { /* exists */ }
   try { db.exec(`ALTER TABLE telegram_alerts ADD COLUMN tour_name TEXT`); console.log('[Telegram DB] Added tour_name column'); } catch(e) { /* exists */ }
+  try { db.exec(`ALTER TABLE telegram_alerts ADD COLUMN tour_url TEXT`); console.log('[Telegram DB] Added tour_url column'); } catch(e) { /* exists */ }
+  try { db.exec(`ALTER TABLE telegram_alerts ADD COLUMN tour_img TEXT`); console.log('[Telegram DB] Added tour_img column'); } catch(e) { /* exists */ }
+  try { db.exec(`ALTER TABLE telegram_alerts ADD COLUMN search_params TEXT`); console.log('[Telegram DB] Added search_params column'); } catch(e) { /* exists */ }
 
   // Prepared statements
   const stmts = {
@@ -133,8 +136,9 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
     `),
     insertAlert: db.prepare(`
       INSERT INTO telegram_alerts (chat_id, username, first_name, country_id, country_name, dept_city_id, dept_city_name,
-        check_in, check_to, nights, adults, children_ages, stars, food, max_price, currency, transport, tour_id, tour_name)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        check_in, check_to, nights, adults, children_ages, stars, food, max_price, currency, transport,
+        tour_id, tour_name, tour_url, tour_img, search_params)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `),
     getActiveAlerts: db.prepare(`SELECT * FROM telegram_alerts WHERE active = 1`),
     getAlertsByChat: db.prepare(`SELECT * FROM telegram_alerts WHERE chat_id = ? AND active = 1`),
@@ -215,100 +219,207 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
     return d.toISOString().split('T')[0];
   }
 
+  // ===== HELPER: Create alert from pre-registered token data =====
+  // This is the NEW flow — frontend pre-registers all tour data, bot just looks it up
+  function handleTokenPayload(msg, name, token) {
+    const row = db.prepare('SELECT data FROM telegram_pending WHERE token = ?').get(token);
+    if (!row) {
+      bot.sendMessage(msg.chat.id,
+        '❌ Link-ul a expirat sau nu a fost găsit.\nÎncearcă din nou de pe site: ' + AGENCY.site,
+        { parse_mode: 'Markdown' }
+      );
+      return;
+    }
+
+    // Delete the pending entry (one-time use)
+    db.prepare('DELETE FROM telegram_pending WHERE token = ?').run(token);
+
+    const d = JSON.parse(row.data);
+    const sp = d.searchParams || {};
+
+    // Extract search params (same data the email flow gets)
+    const countryId = parseInt(sp.countryId) || 0;
+    const deptCityId = parseInt(sp.deptCity) || 1831;
+    const checkIn = sp.checkIn || null;
+    const nights = parseInt(sp.length) || 7;
+    const people = sp.people || '2';
+    const stars = sp.stars ? parseInt(sp.stars) : null;
+    const food = sp.food || null;
+    const transport = sp.transport || 'air';
+    const maxPrice = d.price ? Math.round(parseFloat(d.price)) : null;
+
+    // Find country/city names
+    const country = Object.entries(COUNTRIES).find(([, v]) => v.id === countryId);
+    const countryName = country ? country[0].charAt(0).toUpperCase() + country[0].slice(1) : 'Destinație';
+    const flag = country ? country[1].flag : '🏖️';
+    const dept = Object.entries(DEPARTURE_CITIES).find(([, v]) => v.id === deptCityId);
+    const deptName = dept ? dept[1].label : 'Chișinău';
+
+    // Parse adults/children
+    const adults = parseInt(people.toString()[0]) || 2;
+    let childrenAges = null;
+    if (people.length > 1) {
+      const agesStr = people.toString().slice(1);
+      const ages = [];
+      for (let i = 0; i < agesStr.length; i += 2) {
+        ages.push(parseInt(agesStr.substring(i, i + 2)));
+      }
+      if (ages.length > 0) childrenAges = ages.join(',');
+    }
+
+    const checkTo = checkIn ? addDays(checkIn, 14) : null;
+
+    try {
+      stmts.insertAlert.run(
+        msg.chat.id, msg.from?.username || null, name,
+        countryId, countryName,
+        deptCityId, deptName,
+        checkIn, checkTo,
+        nights, adults, childrenAges,
+        stars, food,
+        maxPrice, 'eur', transport,
+        d.tourId || null,           // tour_id — specific hotel ID
+        d.tourName || null,         // tour_name — hotel name from website
+        d.tourUrl || null,          // tour_url — direct link to hotel
+        d.tourImg || null,          // tour_img — hotel image
+        sp ? JSON.stringify(sp) : null  // search_params — for API replay
+      );
+
+      // Build link: use tour URL if specific hotel, otherwise destination search
+      const link = d.tourUrl || buildZebraturLink({
+        country_id: countryId, dept_city_id: deptCityId,
+        check_in: checkIn, check_to: checkTo,
+        nights, adults, children_ages: childrenAges,
+        stars, food, max_price: maxPrice, currency: 'eur', transport
+      });
+
+      let summary = `✅ *Alertă setată de pe site!*\n\n`;
+      if (d.tourName) {
+        summary += `🏨 *${d.tourName}*\n`;
+      }
+      summary += `${flag} *${countryName}*`;
+      if (d.geo) summary += ` — ${d.geo}`;
+      summary += `\n`;
+      summary += `✈️ Din ${deptName}\n`;
+      summary += `📅 ${checkIn || '—'} | 🌙 ${nights} nopți\n`;
+      summary += `👥 ${adults} adulți${childrenAges ? ' + copii ' + childrenAges + ' ani' : ''}\n`;
+      if (stars) summary += `⭐ ${stars} stele\n`;
+      if (food) summary += `🍽️ ${food.toUpperCase()}\n`;
+      if (maxPrice) summary += `💰 Preț curent: ~${maxPrice} EUR\n`;
+      summary += `\n📬 Vei primi notificare când prețul ${d.tourName ? 'acestui hotel' : ''} se schimbă!\n`;
+      summary += `\n🔗 [Vezi oferta pe ZebraTur](${link})\n`;
+      summary += `\nFolosește /ofertele\\_mele pentru a vedea alertele tale.`;
+
+      bot.sendMessage(msg.chat.id, summary, {
+        parse_mode: 'Markdown',
+        disable_web_page_preview: true
+      });
+
+      console.log(`[Telegram] Token alert created: hotel ${d.tourId} (${d.tourName}) for chat ${msg.chat.id}`);
+    } catch (err) {
+      console.error('[Telegram] Token alert error:', err.message);
+      bot.sendMessage(msg.chat.id, '❌ Eroare la salvarea alertei. Încearcă din nou.');
+    }
+  }
+
+  // ===== HELPER: Create alert from old-format deep link (backward compat) =====
+  function handleOldPayload(msg, name, payload) {
+    const parts = payload.split('_');
+    if (parts.length < 7) return false;
+
+    const countryId = parseInt(parts[0]);
+    const deptCityId = parseInt(parts[1]) || 1831;
+    const checkInRaw = parts[2];
+    const nights = parseInt(parts[3]) || 7;
+    const people = parts[4] || '2';
+    const stars = parts[5] !== '0' ? parseInt(parts[5]) : null;
+    const food = parts[6] !== 'any' ? parts[6].replace(/-/g, ',') : null;
+    const maxPrice = parts[7] ? parseInt(parts[7]) : null;
+    const transport = parts[8] || 'air';
+    const tourId = parts[9] && parts[9] !== '0' ? parts[9] : null;
+
+    let checkIn = null;
+    if (checkInRaw && checkInRaw.length === 8) {
+      checkIn = checkInRaw.substring(0, 4) + '-' + checkInRaw.substring(4, 6) + '-' + checkInRaw.substring(6, 8);
+    }
+
+    const country = Object.entries(COUNTRIES).find(([, v]) => v.id === countryId);
+    const countryName = country ? country[0].charAt(0).toUpperCase() + country[0].slice(1) : 'Destinație';
+    const flag = country ? country[1].flag : '🏖️';
+    const dept = Object.entries(DEPARTURE_CITIES).find(([, v]) => v.id === deptCityId);
+    const deptName = dept ? dept[1].label : 'Chișinău';
+
+    const adults = parseInt(people.toString()[0]) || 2;
+    let childrenAges = null;
+    if (people.length > 1) {
+      const agesStr = people.toString().slice(1);
+      const ages = [];
+      for (let i = 0; i < agesStr.length; i += 2) {
+        ages.push(parseInt(agesStr.substring(i, i + 2)));
+      }
+      if (ages.length > 0) childrenAges = ages.join(',');
+    }
+
+    if (!countryId || !checkIn) return false;
+
+    try {
+      stmts.insertAlert.run(
+        msg.chat.id, msg.from?.username || null, name,
+        countryId, countryName,
+        deptCityId, deptName,
+        checkIn, addDays(checkIn, 14),
+        nights, adults, childrenAges,
+        stars, food,
+        maxPrice, 'eur', transport,
+        tourId, null, null, null, null // tour_id, tour_name, tour_url, tour_img, search_params
+      );
+
+      const link = buildZebraturLink({
+        country_id: countryId, dept_city_id: deptCityId,
+        check_in: checkIn, check_to: addDays(checkIn, 14),
+        nights, adults, children_ages: childrenAges,
+        stars, food, max_price: maxPrice, currency: 'eur', transport
+      });
+
+      let summary = `✅ *Alertă setată de pe site!*\n\n`;
+      summary += `${flag} *${countryName}*\n`;
+      summary += `✈️ Din ${deptName}\n`;
+      summary += `📅 ${checkIn} | 🌙 ${nights} nopți\n`;
+      summary += `👥 ${adults} adulți${childrenAges ? ' + copii ' + childrenAges + ' ani' : ''}\n`;
+      if (stars) summary += `⭐ ${stars} stele\n`;
+      if (food) summary += `🍽️ ${food.toUpperCase()}\n`;
+      if (maxPrice) summary += `💰 Preț curent: ~${maxPrice} EUR\n`;
+      summary += `\n📬 Vei primi notificare când prețul scade!\n`;
+      summary += `\n🔗 [Vezi oferte pe ZebraTur](${link})\n`;
+      summary += `\nFolosește /ofertele\\_mele pentru a vedea alertele tale.`;
+
+      bot.sendMessage(msg.chat.id, summary, {
+        parse_mode: 'Markdown',
+        disable_web_page_preview: true
+      });
+      return true;
+    } catch (err) {
+      console.error('[Telegram] Old deep link alert error:', err.message);
+      return false;
+    }
+  }
+
   // ===== /start COMMAND (with optional deep link payload) =====
   bot.onText(/\/start(?:\s+(.+))?/, (msg, match) => {
     trackUser(msg);
     const name = msg.from?.first_name || 'Salut';
     const payload = match[1];
 
-    // If payload exists, it's a deep link from the website
-    // Format: countryId_deptCity_checkIn_nights_people_stars_food_price_transport
-    if (payload && payload.includes('_')) {
-      const parts = payload.split('_');
-      if (parts.length >= 7) {
-        const countryId = parseInt(parts[0]);
-        const deptCityId = parseInt(parts[1]) || 1831;
-        const checkInRaw = parts[2]; // YYYYMMDD
-        const nights = parseInt(parts[3]) || 7;
-        const people = parts[4] || '2';
-        const stars = parts[5] !== '0' ? parseInt(parts[5]) : null;
-        const food = parts[6] !== 'any' ? parts[6].replace(/-/g, ',') : null; // dash back to comma (ai-uai -> ai,uai)
-        const maxPrice = parts[7] ? parseInt(parts[7]) : null;
-        const transport = parts[8] || 'air';
-        const tourId = parts[9] && parts[9] !== '0' ? parts[9] : null; // specific hotel ID
+    if (payload) {
+      // NEW FORMAT: token-based (starts with "tg" prefix)
+      if (payload.startsWith('tg') && !payload.includes('_')) {
+        handleTokenPayload(msg, name, payload);
+        return;
+      }
 
-        // Parse checkIn date
-        let checkIn = null;
-        if (checkInRaw && checkInRaw.length === 8) {
-          checkIn = checkInRaw.substring(0, 4) + '-' + checkInRaw.substring(4, 6) + '-' + checkInRaw.substring(6, 8);
-        }
-
-        // Find country name
-        const country = Object.entries(COUNTRIES).find(([, v]) => v.id === countryId);
-        const countryName = country ? country[0].charAt(0).toUpperCase() + country[0].slice(1) : 'Destinație';
-        const flag = country ? country[1].flag : '🏖️';
-
-        // Find departure city name
-        const dept = Object.entries(DEPARTURE_CITIES).find(([, v]) => v.id === deptCityId);
-        const deptName = dept ? dept[1].label : 'Chișinău';
-
-        // Parse adults/children from people param
-        const adults = parseInt(people.toString()[0]) || 2;
-        let childrenAges = null;
-        if (people.length > 1) {
-          const agesStr = people.toString().slice(1);
-          const ages = [];
-          for (let i = 0; i < agesStr.length; i += 2) {
-            ages.push(parseInt(agesStr.substring(i, i + 2)));
-          }
-          if (ages.length > 0) childrenAges = ages.join(',');
-        }
-
-        if (countryId && checkIn) {
-          try {
-            stmts.insertAlert.run(
-              msg.chat.id, msg.from?.username || null, name,
-              countryId, countryName,
-              deptCityId, deptName,
-              checkIn, addDays(checkIn, 14),
-              nights, adults, childrenAges,
-              stars, food,
-              maxPrice, 'eur', transport,
-              tourId, null // tour_id, tour_name (name filled on first check)
-            );
-
-            const alertData = {
-              country_id: countryId, dept_city_id: deptCityId,
-              check_in: checkIn, check_to: addDays(checkIn, 14),
-              nights, adults, children_ages: childrenAges,
-              stars, food, max_price: maxPrice, currency: 'eur', transport
-            };
-            const link = buildZebraturLink(alertData);
-
-            let summary = `✅ *Alertă setată de pe site!*\n\n`;
-            if (tourId) {
-              summary += `🏨 *Urmăresc hotelul specific* (ID: ${tourId})\n`;
-            }
-            summary += `${flag} *${countryName}*\n`;
-            summary += `✈️ Din ${deptName}\n`;
-            summary += `📅 ${checkIn} | 🌙 ${nights} nopți\n`;
-            summary += `👥 ${adults} adulți${childrenAges ? ' + copii ' + childrenAges + ' ani' : ''}\n`;
-            if (stars) summary += `⭐ ${stars} stele\n`;
-            if (food) summary += `🍽️ ${food.toUpperCase()}\n`;
-            if (maxPrice) summary += `💰 Preț curent: ~${maxPrice} EUR\n`;
-            summary += `\n📬 Vei primi notificare când prețul ${tourId ? 'acestui hotel' : ''} scade!\n`;
-            summary += `\n🔗 [Vezi oferte pe ZebraTur](${link})\n`;
-            summary += `\nFolosește /ofertele\\_mele pentru a vedea alertele tale.`;
-
-            bot.sendMessage(msg.chat.id, summary, {
-              parse_mode: 'Markdown',
-              disable_web_page_preview: true
-            });
-            return;
-          } catch (err) {
-            console.error('[Telegram] Deep link alert error:', err.message);
-          }
-        }
+      // OLD FORMAT: underscore-separated params (backward compatible)
+      if (payload.includes('_')) {
+        if (handleOldPayload(msg, name, payload)) return;
       }
     }
 
@@ -409,6 +520,7 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
       text += `   👥 ${a.adults} adulți${a.children_ages ? ' + copii ' + a.children_ages : ''}\n`;
       if (a.max_price) text += `   💰 Max: ${a.max_price} ${a.currency}\n`;
       if (a.last_best_price) text += `   📊 ${a.tour_id ? 'Preț actual' : 'Cel mai bun preț'}: *${a.last_best_price} ${a.currency}*\n`;
+      if (a.tour_url) text += `   🔗 [Vezi hotelul](${a.tour_url})\n`;
       text += `   🆔 ID: ${a.id}\n\n`;
     });
     text += `Pentru a opri o alertă: /stop`;
@@ -675,7 +787,7 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
           d.nights || 7, d.adults || 2, d.children_ages || null,
           d.stars || null, d.food || null,
           d.max_price || null, d.currency || 'eur', d.transport || 'air',
-          null, null // tour_id, tour_name — /urmareste tracks whole destination
+          null, null, null, null, null // tour_id, tour_name, tour_url, tour_img, search_params — /urmareste tracks whole destination
         );
 
         const link = buildZebraturLink(d);
@@ -781,10 +893,13 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
 
   // ===== SEND SPECIFIC HOTEL PRICE ALERT =====
   // Used when alert has tour_id (from website deep link) — tracks ONE hotel
+  // Uses tour_url (specific hotel link) just like email notifications do
   async function sendTelegramHotelAlert(alert, oldPrice, newPrice, changePct, hotelData) {
     const country = Object.entries(COUNTRIES).find(([, v]) => v.id === alert.country_id);
     const flag = country ? country[1].flag : '🏖️';
-    const link = buildZebraturLink(alert);
+    // Use the specific hotel URL if available (stored from pre-registration, like email)
+    // Fall back to destination search link only if tour_url is missing
+    const link = alert.tour_url || buildZebraturLink(alert);
     const hotelName = alert.tour_name || hotelData.name || `Hotel #${alert.tour_id}`;
 
     const isDecrease = newPrice < oldPrice;

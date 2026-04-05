@@ -75,6 +75,15 @@ db.exec(`
   );
 `);
 
+// Telegram pre-registration table (stores tour data before user opens deep link)
+db.exec(`
+  CREATE TABLE IF NOT EXISTS telegram_pending (
+    token TEXT PRIMARY KEY,
+    data TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
 // Migration: add search_params column if missing
 try {
   db.exec(`ALTER TABLE watchers ADD COLUMN search_params TEXT`);
@@ -651,6 +660,31 @@ app.post('/api/watch', async (req, res) => {
     });
   } catch (err) {
     console.error('[Watch] Error:', err.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Telegram pre-registration — stores tour data so the bot can retrieve it via token
+// This gives Telegram the same data quality as email (name, URL, image, searchParams)
+app.post('/api/telegram-preregister', (req, res) => {
+  try {
+    const { token, tourId, tourName, tourUrl, tourImg, price, currency, geo, dates, stars, food, searchParams } = req.body;
+
+    if (!token) {
+      return res.status(400).json({ error: 'Token required' });
+    }
+
+    const data = JSON.stringify({ tourId, tourName, tourUrl, tourImg, price, currency, geo, dates, stars, food, searchParams });
+
+    db.prepare('INSERT OR REPLACE INTO telegram_pending (token, data) VALUES (?, ?)').run(token, data);
+
+    // Clean up old pending entries (older than 24h)
+    db.prepare("DELETE FROM telegram_pending WHERE created_at < datetime('now', '-24 hours')").run();
+
+    console.log(`[TG-PreReg] Token ${token} stored for hotel ${tourId} (${tourName || 'unknown'})`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[TG-PreReg] Error:', err.message);
     res.status(500).json({ error: 'Server error' });
   }
 });
