@@ -116,6 +116,10 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
     );
   `);
 
+  // Migration: add tour_id and tour_name columns for specific hotel tracking
+  try { db.exec(`ALTER TABLE telegram_alerts ADD COLUMN tour_id TEXT`); console.log('[Telegram DB] Added tour_id column'); } catch(e) { /* exists */ }
+  try { db.exec(`ALTER TABLE telegram_alerts ADD COLUMN tour_name TEXT`); console.log('[Telegram DB] Added tour_name column'); } catch(e) { /* exists */ }
+
   // Prepared statements
   const stmts = {
     upsertUser: db.prepare(`
@@ -129,8 +133,8 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
     `),
     insertAlert: db.prepare(`
       INSERT INTO telegram_alerts (chat_id, username, first_name, country_id, country_name, dept_city_id, dept_city_name,
-        check_in, check_to, nights, adults, children_ages, stars, food, max_price, currency, transport)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        check_in, check_to, nights, adults, children_ages, stars, food, max_price, currency, transport, tour_id, tour_name)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `),
     getActiveAlerts: db.prepare(`SELECT * FROM telegram_alerts WHERE active = 1`),
     getAlertsByChat: db.prepare(`SELECT * FROM telegram_alerts WHERE chat_id = ? AND active = 1`),
@@ -139,6 +143,7 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
       UPDATE telegram_alerts SET last_best_price = ?, last_best_hotel = ?, last_checked = CURRENT_TIMESTAMP WHERE id = ?
     `),
     markAlertNotified: db.prepare(`UPDATE telegram_alerts SET last_notified = CURRENT_TIMESTAMP WHERE id = ?`),
+    updateAlertTourName: db.prepare(`UPDATE telegram_alerts SET tour_name = ? WHERE id = ?`),
     getUserCount: db.prepare(`SELECT COUNT(*) as count FROM telegram_users`),
     getActiveAlertCount: db.prepare(`SELECT COUNT(*) as count FROM telegram_alerts WHERE active = 1`),
   };
@@ -230,6 +235,7 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
         const food = parts[6] !== 'any' ? parts[6].replace(/-/g, ',') : null; // dash back to comma (ai-uai -> ai,uai)
         const maxPrice = parts[7] ? parseInt(parts[7]) : null;
         const transport = parts[8] || 'air';
+        const tourId = parts[9] && parts[9] !== '0' ? parts[9] : null; // specific hotel ID
 
         // Parse checkIn date
         let checkIn = null;
@@ -267,7 +273,8 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
               checkIn, addDays(checkIn, 14),
               nights, adults, childrenAges,
               stars, food,
-              maxPrice, 'eur', transport
+              maxPrice, 'eur', transport,
+              tourId, null // tour_id, tour_name (name filled on first check)
             );
 
             const alertData = {
@@ -279,6 +286,9 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
             const link = buildZebraturLink(alertData);
 
             let summary = `✅ *Alertă setată de pe site!*\n\n`;
+            if (tourId) {
+              summary += `🏨 *Urmăresc hotelul specific* (ID: ${tourId})\n`;
+            }
             summary += `${flag} *${countryName}*\n`;
             summary += `✈️ Din ${deptName}\n`;
             summary += `📅 ${checkIn} | 🌙 ${nights} nopți\n`;
@@ -286,7 +296,7 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
             if (stars) summary += `⭐ ${stars} stele\n`;
             if (food) summary += `🍽️ ${food.toUpperCase()}\n`;
             if (maxPrice) summary += `💰 Preț curent: ~${maxPrice} EUR\n`;
-            summary += `\n📬 Vei primi notificare când prețul scade!\n`;
+            summary += `\n📬 Vei primi notificare când prețul ${tourId ? 'acestui hotel' : ''} scade!\n`;
             summary += `\n🔗 [Vezi oferte pe ZebraTur](${link})\n`;
             summary += `\nFolosește /ofertele\\_mele pentru a vedea alertele tale.`;
 
@@ -389,11 +399,16 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
     alerts.forEach((a, i) => {
       const country = Object.entries(COUNTRIES).find(([, v]) => v.id === a.country_id);
       const flag = country ? country[1].flag : '🏖️';
-      text += `${i + 1}. ${flag} *${a.country_name || 'Destinație'}*\n`;
+      if (a.tour_id) {
+        text += `${i + 1}. 🏨 *${a.tour_name || 'Hotel #' + a.tour_id}*\n`;
+        text += `   ${flag} ${a.country_name || 'Destinație'}\n`;
+      } else {
+        text += `${i + 1}. ${flag} *${a.country_name || 'Destinație'}*\n`;
+      }
       text += `   📅 ${a.check_in} | 🌙 ${a.nights} nopți\n`;
       text += `   👥 ${a.adults} adulți${a.children_ages ? ' + copii ' + a.children_ages : ''}\n`;
       if (a.max_price) text += `   💰 Max: ${a.max_price} ${a.currency}\n`;
-      if (a.last_best_price) text += `   📊 Cel mai bun preț: *${a.last_best_price} ${a.currency}*\n`;
+      if (a.last_best_price) text += `   📊 ${a.tour_id ? 'Preț actual' : 'Cel mai bun preț'}: *${a.last_best_price} ${a.currency}*\n`;
       text += `   🆔 ID: ${a.id}\n\n`;
     });
     text += `Pentru a opri o alertă: /stop`;
@@ -659,7 +674,8 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
           d.check_in, d.check_to || null,
           d.nights || 7, d.adults || 2, d.children_ages || null,
           d.stars || null, d.food || null,
-          d.max_price || null, d.currency || 'eur', d.transport || 'air'
+          d.max_price || null, d.currency || 'eur', d.transport || 'air',
+          null, null // tour_id, tour_name — /urmareste tracks whole destination
         );
 
         const link = buildZebraturLink(d);
@@ -763,6 +779,55 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
     }
   }
 
+  // ===== SEND SPECIFIC HOTEL PRICE ALERT =====
+  // Used when alert has tour_id (from website deep link) — tracks ONE hotel
+  async function sendTelegramHotelAlert(alert, oldPrice, newPrice, changePct, hotelData) {
+    const country = Object.entries(COUNTRIES).find(([, v]) => v.id === alert.country_id);
+    const flag = country ? country[1].flag : '🏖️';
+    const link = buildZebraturLink(alert);
+    const hotelName = alert.tour_name || hotelData.name || `Hotel #${alert.tour_id}`;
+
+    const isDecrease = newPrice < oldPrice;
+    const arrow = isDecrease ? '📉' : '📈';
+    const direction = isDecrease ? 'scăzut' : 'crescut';
+
+    let text = `🔔 *Alertă preț hotel!*\n\n`;
+    text += `🏨 *${hotelName}*\n`;
+    text += `${flag} ${alert.country_name}\n\n`;
+
+    if (oldPrice) {
+      text += `${arrow} Prețul a *${direction}*:\n`;
+      text += `   ~${oldPrice.toFixed(0)}~ → *${newPrice.toFixed(0)} ${(alert.currency || 'eur').toUpperCase()}*/pers\n`;
+      text += `   ${changePct > 0 ? '+' : ''}${changePct.toFixed(1)}%\n\n`;
+    } else {
+      text += `💰 Preț actual: *${newPrice.toFixed(0)} ${(alert.currency || 'eur').toUpperCase()}*/pers\n\n`;
+    }
+
+    text += `📅 ${alert.check_in} | 🌙 ${alert.nights} nopți | 👥 ${alert.adults} pers\n`;
+    if (alert.food) text += `🍽️ ${alert.food.toUpperCase()}\n`;
+    text += `\n📞 Rezervări: ${AGENCY.phone}`;
+
+    try {
+      await bot.sendMessage(alert.chat_id, text, {
+        parse_mode: 'Markdown',
+        disable_web_page_preview: true,
+        reply_markup: {
+          inline_keyboard: [[
+            { text: '🔗 Vezi oferta', url: link }
+          ]]
+        }
+      });
+      stmts.markAlertNotified.run(alert.id);
+      console.log(`[Telegram] Hotel alert sent to ${alert.chat_id} for hotel ${alert.tour_id} (${hotelName})`);
+    } catch (err) {
+      console.error(`[Telegram] Failed to send hotel alert to ${alert.chat_id}:`, err.message);
+      if (err.response?.statusCode === 403) {
+        console.log(`[Telegram] User ${alert.chat_id} blocked the bot, deactivating alerts`);
+        db.prepare('UPDATE telegram_alerts SET active = 0 WHERE chat_id = ?').run(alert.chat_id);
+      }
+    }
+  }
+
   // ===== CHECK PRICES FOR TELEGRAM ALERTS =====
   async function checkTelegramAlerts() {
     const alerts = stmts.getActiveAlerts.all();
@@ -815,7 +880,49 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
         if (sortedHotels.length === 0) continue;
 
         for (const alert of group.alerts) {
-          // Find best price within budget
+          // === SPECIFIC HOTEL TRACKING (when tour_id exists — from website deep link) ===
+          if (alert.tour_id) {
+            const hotelData = hotelPrices[alert.tour_id];
+            if (!hotelData) {
+              console.log(`[Telegram] Hotel ${alert.tour_id} not found in search results for alert #${alert.id}`);
+              continue;
+            }
+
+            const newPrice = hotelData.price;
+            if (!newPrice || newPrice <= 0) continue;
+
+            // Save hotel name on first discovery
+            if (!alert.tour_name && hotelData.name) {
+              stmts.updateAlertTourName.run(hotelData.name, alert.id);
+              alert.tour_name = hotelData.name; // update in-memory too
+            }
+
+            const oldPrice = alert.last_best_price;
+            stmts.updateAlertPrice.run(newPrice, hotelData.name || alert.tour_id, alert.id);
+
+            // Calculate change %
+            const changePct = oldPrice ? ((newPrice - oldPrice) / oldPrice) * 100 : 0;
+
+            // Notify if: first check, or price changed >= 3%
+            const shouldNotify =
+              !oldPrice ||
+              (Math.abs(changePct) >= 3) ||
+              (!alert.last_notified);
+
+            // Cooldown: don't notify more than once per 6 hours
+            if (alert.last_notified) {
+              const lastNotif = new Date(alert.last_notified).getTime();
+              const cooldown = 6 * 60 * 60 * 1000;
+              if (Date.now() - lastNotif < cooldown) continue;
+            }
+
+            if (shouldNotify) {
+              await sendTelegramHotelAlert(alert, oldPrice, newPrice, changePct, hotelData);
+            }
+            continue;
+          }
+
+          // === DESTINATION TRACKING (no tour_id — from /urmareste command) ===
           let relevantOffers = sortedHotels;
           if (alert.max_price) {
             relevantOffers = sortedHotels.filter(h => h.price <= alert.max_price);
@@ -872,6 +979,7 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
     checkTelegramAlerts,
     stmts,
     sendTelegramPriceAlert,
+    sendTelegramHotelAlert,
   };
 }
 
