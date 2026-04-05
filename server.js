@@ -767,7 +767,7 @@ app.get('/', (req, res) => {
     status: 'ok',
     service: `${AGENCY.name} Price Tracker`,
     activeWatchers: watcherCount.count,
-    checkInterval: `${intervalMinutes}min`,
+    checkInterval: cronExpr,
     threshold: `${THRESHOLD}%`,
     ...telegramStats
   });
@@ -992,5 +992,5 @@ app.post('/api/broadcast', async (req, res) => {
 // ===== START SERVER =====
 app.listen(PORT, () => {
   console.log(`[Server] ${AGENCY.name} Price Tracker running on port ${PORT}`);
-  console.log(`[Server] Threshold: ${THRESHOLD}% | Interval: ${intervalMinutes}min`);
+  console.log(`[Server] Threshold: ${THRESHOLD}% | Schedule: ${cronExpr}`);
 });
