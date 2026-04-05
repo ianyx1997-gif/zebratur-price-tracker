@@ -952,141 +952,210 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
   }
 
   // ===== CHECK PRICES FOR TELEGRAM ALERTS =====
+  // Two paths: alerts WITH search_params use them directly (like email — exact same API call)
+  //            alerts WITHOUT search_params reconstruct from columns (legacy/urmareste)
   async function checkTelegramAlerts() {
     const alerts = stmts.getActiveAlerts.all();
     if (alerts.length === 0) return;
 
     console.log(`[Telegram] Checking ${alerts.length} active alerts...`);
 
-    // Group by search params to batch API calls
-    const groups = {};
+    // Split alerts into two groups: those with stored search_params and those without
+    const withSearchParams = [];   // from website (pre-registration) — use exact params like email
+    const withoutSearchParams = []; // from /urmareste command — reconstruct from columns
+
     for (const alert of alerts) {
-      const key = JSON.stringify({
-        countryId: alert.country_id,
-        checkIn: alert.check_in,
-        checkTo: alert.check_to,
-        length: String(alert.nights || 7),
-        deptCity: String(alert.dept_city_id || 1831),
-        people: buildPeopleParam(alert.adults, alert.children_ages),
-        food: alert.food || '',
-        stars: alert.stars ? String(alert.stars) : '',
-        transport: alert.transport || 'air',
-      });
-      if (!groups[key]) groups[key] = { params: JSON.parse(key), alerts: [] };
-      groups[key].alerts.push(alert);
+      if (alert.search_params) {
+        withSearchParams.push(alert);
+      } else {
+        withoutSearchParams.push(alert);
+      }
     }
 
-    for (const group of Object.values(groups)) {
-      try {
-        // Build search params matching Otpusk API format
-        const sp = {
-          countryId: group.params.countryId,
-          checkIn: group.params.checkIn,
-          checkTo: group.params.checkTo || group.params.checkIn,
-          length: group.params.length,
-          people: group.params.people,
-          food: group.params.food,
-          stars: group.params.stars,
-          transport: group.params.transport,
-          deptCity: group.params.deptCity,
-          currencyLocal: 'eur',
-        };
-
-        const hotelPrices = await searchPricesFn(sp);
-        if (!hotelPrices) continue;
-
-        // Sort hotels by price
-        const sortedHotels = Object.entries(hotelPrices)
-          .map(([id, data]) => ({ id, ...data }))
-          .sort((a, b) => a.price - b.price);
-
-        if (sortedHotels.length === 0) continue;
-
-        for (const alert of group.alerts) {
-          // === SPECIFIC HOTEL TRACKING (when tour_id exists — from website deep link) ===
-          if (alert.tour_id) {
-            const hotelData = hotelPrices[alert.tour_id];
-            if (!hotelData) {
-              console.log(`[Telegram] Hotel ${alert.tour_id} not found in search results for alert #${alert.id}`);
-              continue;
-            }
-
-            const newPrice = hotelData.price;
-            if (!newPrice || newPrice <= 0) continue;
-
-            // Save hotel name on first discovery
-            if (!alert.tour_name && hotelData.name) {
-              stmts.updateAlertTourName.run(hotelData.name, alert.id);
-              alert.tour_name = hotelData.name; // update in-memory too
-            }
-
-            const oldPrice = alert.last_best_price;
-            stmts.updateAlertPrice.run(newPrice, hotelData.name || alert.tour_id, alert.id);
-
-            // Calculate change %
-            const changePct = oldPrice ? ((newPrice - oldPrice) / oldPrice) * 100 : 0;
-
-            // For specific hotel: ONLY notify on real price change >= 3%
-            // We already know the initial price (set on subscription), so no "first check" alert needed
-            if (!oldPrice) {
-              // First check — just record the price, don't send alert
-              console.log(`[Telegram] Hotel ${alert.tour_id}: first price recorded ${newPrice} EUR`);
-              continue;
-            }
-
-            if (Math.abs(changePct) < 3) {
-              // Price didn't change enough — skip
-              continue;
-            }
-
-            // Cooldown: don't notify more than once per 4 hours
-            if (alert.last_notified) {
-              const lastNotif = new Date(alert.last_notified).getTime();
-              const cooldown = 4 * 60 * 60 * 1000;
-              if (Date.now() - lastNotif < cooldown) continue;
-            }
-
-            console.log(`[Telegram] Hotel ${alert.tour_id} (${alert.tour_name}): ${oldPrice} → ${newPrice} (${changePct > 0 ? '+' : ''}${changePct.toFixed(1)}%) — sending alert`);
-            await sendTelegramHotelAlert(alert, oldPrice, newPrice, changePct, hotelData);
-            continue;
-          }
-
-          // === DESTINATION TRACKING (no tour_id — from /urmareste command) ===
-          let relevantOffers = sortedHotels;
-          if (alert.max_price) {
-            relevantOffers = sortedHotels.filter(h => h.price <= alert.max_price);
-          }
-          if (relevantOffers.length === 0) continue;
-
-          const bestOffer = relevantOffers[0];
-          const bestPrice = bestOffer.price;
-
-          // Update price in DB
-          stmts.updateAlertPrice.run(bestPrice, bestOffer.name || bestOffer.id, alert.id);
-
-          // Notify if: first check, or price dropped significantly
-          const shouldNotify =
-            !alert.last_best_price ||
-            (bestPrice < alert.last_best_price * 0.97) || // 3% drop
-            (!alert.last_notified); // Never notified before
-
-          // Cooldown: don't notify more than once per 6 hours
-          if (alert.last_notified) {
-            const lastNotif = new Date(alert.last_notified).getTime();
-            const cooldown = 6 * 60 * 60 * 1000; // 6 hours
-            if (Date.now() - lastNotif < cooldown) continue;
-          }
-
-          if (shouldNotify) {
-            await sendTelegramPriceAlert(alert, bestPrice, bestOffer.name, relevantOffers.slice(0, 5));
-          }
+    // ===== PATH 1: Alerts with stored search_params (SAME logic as email checkAllPrices) =====
+    if (withSearchParams.length > 0) {
+      // Group by search params to batch API calls — EXACTLY like email does
+      const searchGroups = {};
+      for (const alert of withSearchParams) {
+        try {
+          const sp = JSON.parse(alert.search_params);
+          const key = JSON.stringify({
+            countryId: sp.countryId,
+            checkIn: sp.checkIn,
+            checkTo: sp.checkTo,
+            length: sp.length,
+            lengthTo: sp.lengthTo,
+            deptCity: sp.deptCity || '1831',
+            people: sp.people || '2',
+            food: sp.food || '',
+            stars: sp.stars || '',
+            transport: sp.transport || 'air'
+          });
+          if (!searchGroups[key]) searchGroups[key] = { params: sp, alerts: [] };
+          searchGroups[key].alerts.push(alert);
+        } catch (e) {
+          // Bad JSON — fall back to column-based
+          withoutSearchParams.push(alert);
         }
-
-        // Delay between groups
-        await new Promise(r => setTimeout(r, 3000));
-      } catch (err) {
-        console.error('[Telegram] Search group error:', err.message);
       }
+
+      console.log(`[Telegram] ${Object.keys(searchGroups).length} search groups (with stored params), ${withoutSearchParams.length} legacy alerts`);
+
+      for (const group of Object.values(searchGroups)) {
+        try {
+          // Use stored search params directly — same API call as email
+          const hotelPrices = await searchPricesFn(group.params);
+          if (!hotelPrices) continue;
+
+          const sortedHotels = Object.entries(hotelPrices)
+            .map(([id, data]) => ({ id, ...data }))
+            .sort((a, b) => a.price - b.price);
+
+          if (sortedHotels.length === 0) continue;
+
+          for (const alert of group.alerts) {
+            await processAlertWithResults(alert, hotelPrices, sortedHotels);
+          }
+
+          await new Promise(r => setTimeout(r, 3000));
+        } catch (err) {
+          console.error('[Telegram] Search group error (stored params):', err.message);
+        }
+      }
+    }
+
+    // ===== PATH 2: Alerts without search_params (legacy — reconstruct from columns) =====
+    if (withoutSearchParams.length > 0) {
+      const groups = {};
+      for (const alert of withoutSearchParams) {
+        const key = JSON.stringify({
+          countryId: alert.country_id,
+          checkIn: alert.check_in,
+          checkTo: alert.check_to,
+          length: String(alert.nights || 7),
+          deptCity: String(alert.dept_city_id || 1831),
+          people: buildPeopleParam(alert.adults, alert.children_ages),
+          food: alert.food || '',
+          stars: alert.stars ? String(alert.stars) : '',
+          transport: alert.transport || 'air',
+        });
+        if (!groups[key]) groups[key] = { params: JSON.parse(key), alerts: [] };
+        groups[key].alerts.push(alert);
+      }
+
+      for (const group of Object.values(groups)) {
+        try {
+          const sp = {
+            countryId: group.params.countryId,
+            checkIn: group.params.checkIn,
+            checkTo: group.params.checkTo || group.params.checkIn,
+            length: group.params.length,
+            people: group.params.people,
+            food: group.params.food,
+            stars: group.params.stars,
+            transport: group.params.transport,
+            deptCity: group.params.deptCity,
+            currencyLocal: 'eur',
+          };
+
+          const hotelPrices = await searchPricesFn(sp);
+          if (!hotelPrices) continue;
+
+          const sortedHotels = Object.entries(hotelPrices)
+            .map(([id, data]) => ({ id, ...data }))
+            .sort((a, b) => a.price - b.price);
+
+          if (sortedHotels.length === 0) continue;
+
+          for (const alert of group.alerts) {
+            await processAlertWithResults(alert, hotelPrices, sortedHotels);
+          }
+
+          await new Promise(r => setTimeout(r, 3000));
+        } catch (err) {
+          console.error('[Telegram] Search group error (legacy):', err.message);
+        }
+      }
+    }
+  }
+
+  // ===== PROCESS SINGLE ALERT WITH SEARCH RESULTS =====
+  // Shared logic for both paths (stored params and legacy)
+  async function processAlertWithResults(alert, hotelPrices, sortedHotels) {
+    const tourIdStr = alert.tour_id ? String(alert.tour_id) : null;
+
+    // === SPECIFIC HOTEL TRACKING (when tour_id exists — from website deep link) ===
+    if (tourIdStr) {
+      // Try both string and number keys — Otpusk API can return either
+      const hotelData = hotelPrices[tourIdStr] || hotelPrices[parseInt(tourIdStr)];
+      if (!hotelData) {
+        console.log(`[Telegram] Hotel ${tourIdStr} not found in search results for alert #${alert.id} (available: ${Object.keys(hotelPrices).slice(0, 5).join(', ')}...)`);
+        return;
+      }
+
+      const newPrice = hotelData.price;
+      if (!newPrice || newPrice <= 0) return;
+
+      // Save hotel name on first discovery
+      if (!alert.tour_name && hotelData.name) {
+        stmts.updateAlertTourName.run(hotelData.name, alert.id);
+        alert.tour_name = hotelData.name;
+      }
+
+      const oldPrice = alert.last_best_price;
+      stmts.updateAlertPrice.run(newPrice, hotelData.name || tourIdStr, alert.id);
+
+      // Calculate change %
+      const changePct = oldPrice ? ((newPrice - oldPrice) / oldPrice) * 100 : 0;
+
+      // No previous price — just record, don't alert
+      if (!oldPrice) {
+        console.log(`[Telegram] Hotel ${tourIdStr}: first price recorded ${newPrice} EUR`);
+        return;
+      }
+
+      // Price didn't change enough — skip
+      if (Math.abs(changePct) < 3) return;
+
+      // Cooldown: don't notify more than once per 4 hours
+      if (alert.last_notified) {
+        const lastNotif = new Date(alert.last_notified).getTime();
+        const cooldown = 4 * 60 * 60 * 1000;
+        if (Date.now() - lastNotif < cooldown) return;
+      }
+
+      console.log(`[Telegram] Hotel ${tourIdStr} (${alert.tour_name}): ${oldPrice} → ${newPrice} (${changePct > 0 ? '+' : ''}${changePct.toFixed(1)}%) — sending alert`);
+      await sendTelegramHotelAlert(alert, oldPrice, newPrice, changePct, hotelData);
+      return;
+    }
+
+    // === DESTINATION TRACKING (no tour_id — from /urmareste command) ===
+    let relevantOffers = sortedHotels;
+    if (alert.max_price) {
+      relevantOffers = sortedHotels.filter(h => h.price <= alert.max_price);
+    }
+    if (relevantOffers.length === 0) return;
+
+    const bestOffer = relevantOffers[0];
+    const bestPrice = bestOffer.price;
+
+    stmts.updateAlertPrice.run(bestPrice, bestOffer.name || bestOffer.id, alert.id);
+
+    // Notify if: first check, or price dropped significantly
+    const shouldNotify =
+      !alert.last_best_price ||
+      (bestPrice < alert.last_best_price * 0.97) ||
+      (!alert.last_notified);
+
+    // Cooldown: don't notify more than once per 6 hours
+    if (alert.last_notified) {
+      const lastNotif = new Date(alert.last_notified).getTime();
+      const cooldown = 6 * 60 * 60 * 1000;
+      if (Date.now() - lastNotif < cooldown) return;
+    }
+
+    if (shouldNotify) {
+      await sendTelegramPriceAlert(alert, bestPrice, bestOffer.name, relevantOffers.slice(0, 5));
     }
   }
 
