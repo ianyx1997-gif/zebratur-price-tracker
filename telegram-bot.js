@@ -210,11 +210,99 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
     return d.toISOString().split('T')[0];
   }
 
-  // ===== /start COMMAND =====
-  bot.onText(/\/start/, (msg) => {
+  // ===== /start COMMAND (with optional deep link payload) =====
+  bot.onText(/\/start(?:\s+(.+))?/, (msg, match) => {
     trackUser(msg);
     const name = msg.from?.first_name || 'Salut';
+    const payload = match[1];
 
+    // If payload exists, it's a deep link from the website
+    // Format: countryId_deptCity_checkIn_nights_people_stars_food_price_transport
+    if (payload && payload.includes('_')) {
+      const parts = payload.split('_');
+      if (parts.length >= 7) {
+        const countryId = parseInt(parts[0]);
+        const deptCityId = parseInt(parts[1]) || 1831;
+        const checkInRaw = parts[2]; // YYYYMMDD
+        const nights = parseInt(parts[3]) || 7;
+        const people = parts[4] || '2';
+        const stars = parts[5] !== '0' ? parseInt(parts[5]) : null;
+        const food = parts[6] !== 'any' ? parts[6] : null;
+        const maxPrice = parts[7] ? parseInt(parts[7]) : null;
+        const transport = parts[8] || 'air';
+
+        // Parse checkIn date
+        let checkIn = null;
+        if (checkInRaw && checkInRaw.length === 8) {
+          checkIn = checkInRaw.substring(0, 4) + '-' + checkInRaw.substring(4, 6) + '-' + checkInRaw.substring(6, 8);
+        }
+
+        // Find country name
+        const country = Object.entries(COUNTRIES).find(([, v]) => v.id === countryId);
+        const countryName = country ? country[0].charAt(0).toUpperCase() + country[0].slice(1) : 'Destinație';
+        const flag = country ? country[1].flag : '🏖️';
+
+        // Find departure city name
+        const dept = Object.entries(DEPARTURE_CITIES).find(([, v]) => v.id === deptCityId);
+        const deptName = dept ? dept[1].label : 'Chișinău';
+
+        // Parse adults/children from people param
+        const adults = parseInt(people.toString()[0]) || 2;
+        let childrenAges = null;
+        if (people.length > 1) {
+          const agesStr = people.toString().slice(1);
+          const ages = [];
+          for (let i = 0; i < agesStr.length; i += 2) {
+            ages.push(parseInt(agesStr.substring(i, i + 2)));
+          }
+          if (ages.length > 0) childrenAges = ages.join(',');
+        }
+
+        if (countryId && checkIn) {
+          try {
+            stmts.insertAlert.run(
+              msg.chat.id, msg.from?.username || null, name,
+              countryId, countryName,
+              deptCityId, deptName,
+              checkIn, addDays(checkIn, 14),
+              nights, adults, childrenAges,
+              stars, food,
+              maxPrice, 'eur', transport
+            );
+
+            const alertData = {
+              country_id: countryId, dept_city_id: deptCityId,
+              check_in: checkIn, check_to: addDays(checkIn, 14),
+              nights, adults, children_ages: childrenAges,
+              stars, food, max_price: maxPrice, currency: 'eur', transport
+            };
+            const link = buildZebraturLink(alertData);
+
+            let summary = `✅ *Alertă setată de pe site!*\n\n`;
+            summary += `${flag} *${countryName}*\n`;
+            summary += `✈️ Din ${deptName}\n`;
+            summary += `📅 ${checkIn} | 🌙 ${nights} nopți\n`;
+            summary += `👥 ${adults} adulți${childrenAges ? ' + copii ' + childrenAges + ' ani' : ''}\n`;
+            if (stars) summary += `⭐ ${stars} stele\n`;
+            if (food) summary += `🍽️ ${food.toUpperCase()}\n`;
+            if (maxPrice) summary += `💰 Preț curent: ~${maxPrice} EUR\n`;
+            summary += `\n📬 Vei primi notificare când prețul scade!\n`;
+            summary += `\n🔗 [Vezi oferte pe ZebraTur](${link})\n`;
+            summary += `\nFolosește /ofertele\\_mele pentru a vedea alertele tale.`;
+
+            bot.sendMessage(msg.chat.id, summary, {
+              parse_mode: 'Markdown',
+              disable_web_page_preview: true
+            });
+            return;
+          } catch (err) {
+            console.error('[Telegram] Deep link alert error:', err.message);
+          }
+        }
+      }
+    }
+
+    // Normal /start (no payload)
     bot.sendMessage(msg.chat.id,
       `👋 Bun venit, *${name}*!\n\n` +
       `Sunt botul *${AGENCY.name}* — te ajut să urmărești prețurile la tururi și primești notificări când prețul scade.\n\n` +
