@@ -147,6 +147,8 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
       UPDATE telegram_alerts SET last_best_price = ?, last_best_hotel = ?, last_checked = CURRENT_TIMESTAMP WHERE id = ?
     `),
     markAlertNotified: db.prepare(`UPDATE telegram_alerts SET last_notified = CURRENT_TIMESTAMP WHERE id = ?`),
+    setInitialPrice: db.prepare(`UPDATE telegram_alerts SET last_best_price = ?, last_best_hotel = ?, last_checked = CURRENT_TIMESTAMP WHERE id = ?`),
+    getLastInsertId: db.prepare(`SELECT last_insert_rowid() as id`),
     updateAlertTourName: db.prepare(`UPDATE telegram_alerts SET tour_name = ? WHERE id = ?`),
     getUserCount: db.prepare(`SELECT COUNT(*) as count FROM telegram_users`),
     getActiveAlertCount: db.prepare(`SELECT COUNT(*) as count FROM telegram_alerts WHERE active = 1`),
@@ -270,7 +272,7 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
     const checkTo = checkIn ? addDays(checkIn, 14) : null;
 
     try {
-      stmts.insertAlert.run(
+      const result = stmts.insertAlert.run(
         msg.chat.id, msg.from?.username || null, name,
         countryId, countryName,
         deptCityId, deptName,
@@ -284,6 +286,12 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
         d.tourImg || null,          // tour_img — hotel image
         sp ? JSON.stringify(sp) : null  // search_params — for API replay
       );
+
+      // Set initial price so the first check doesn't trigger a false alert
+      // (same as email: we already know the price from the website)
+      if (maxPrice && result.lastInsertRowid) {
+        stmts.setInitialPrice.run(maxPrice, d.tourName || d.tourId || 'unknown', result.lastInsertRowid);
+      }
 
       // Build link: use tour URL if specific hotel, otherwise destination search
       const link = d.tourUrl || buildZebraturLink({
@@ -1018,22 +1026,28 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
             // Calculate change %
             const changePct = oldPrice ? ((newPrice - oldPrice) / oldPrice) * 100 : 0;
 
-            // Notify if: first check, or price changed >= 3%
-            const shouldNotify =
-              !oldPrice ||
-              (Math.abs(changePct) >= 3) ||
-              (!alert.last_notified);
+            // For specific hotel: ONLY notify on real price change >= 3%
+            // We already know the initial price (set on subscription), so no "first check" alert needed
+            if (!oldPrice) {
+              // First check — just record the price, don't send alert
+              console.log(`[Telegram] Hotel ${alert.tour_id}: first price recorded ${newPrice} EUR`);
+              continue;
+            }
 
-            // Cooldown: don't notify more than once per 6 hours
+            if (Math.abs(changePct) < 3) {
+              // Price didn't change enough — skip
+              continue;
+            }
+
+            // Cooldown: don't notify more than once per 4 hours
             if (alert.last_notified) {
               const lastNotif = new Date(alert.last_notified).getTime();
-              const cooldown = 6 * 60 * 60 * 1000;
+              const cooldown = 4 * 60 * 60 * 1000;
               if (Date.now() - lastNotif < cooldown) continue;
             }
 
-            if (shouldNotify) {
-              await sendTelegramHotelAlert(alert, oldPrice, newPrice, changePct, hotelData);
-            }
+            console.log(`[Telegram] Hotel ${alert.tour_id} (${alert.tour_name}): ${oldPrice} → ${newPrice} (${changePct > 0 ? '+' : ''}${changePct.toFixed(1)}%) — sending alert`);
+            await sendTelegramHotelAlert(alert, oldPrice, newPrice, changePct, hotelData);
             continue;
           }
 
