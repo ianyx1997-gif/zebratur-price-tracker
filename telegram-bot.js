@@ -76,6 +76,12 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
   const bot = new TelegramBot(token, { polling: true });
   console.log('[Telegram] Bot started with polling');
 
+  // ===== ESCAPE MARKDOWN special chars in text (prevents parse errors) =====
+  function esc(text) {
+    if (!text) return '';
+    return String(text).replace(/([*_`\[\]])/g, '\\$1');
+  }
+
   // ===== DB SETUP =====
   db.exec(`
     CREATE TABLE IF NOT EXISTS telegram_alerts (
@@ -304,16 +310,16 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
 
       let summary = `✅ *Alertă setată de pe site!*\n\n`;
       if (d.tourName) {
-        summary += `🏨 *${d.tourName}*\n`;
+        summary += `🏨 *${esc(d.tourName)}*\n`;
       }
-      summary += `${flag} *${countryName}*`;
-      if (d.geo) summary += ` — ${d.geo}`;
+      summary += `${flag} *${esc(countryName)}*`;
+      if (d.geo) summary += ` — ${esc(d.geo)}`;
       summary += `\n`;
-      summary += `✈️ Din ${deptName}\n`;
+      summary += `✈️ Din ${esc(deptName)}\n`;
       summary += `📅 ${checkIn || '—'} | 🌙 ${nights} nopți\n`;
       summary += `👥 ${adults} adulți${childrenAges ? ' + copii ' + childrenAges + ' ani' : ''}\n`;
       if (stars) summary += `⭐ ${stars} stele\n`;
-      if (food) summary += `🍽️ ${food.toUpperCase()}\n`;
+      if (food) summary += `🍽️ ${esc(food).toUpperCase()}\n`;
       if (maxPrice) summary += `💰 Preț curent: ~${maxPrice} EUR\n`;
       summary += `\n📬 Vei primi notificare când prețul ${d.tourName ? 'acestui hotel' : ''} se schimbă!\n`;
       summary += `\n🔗 [Vezi oferta pe ZebraTur](${link})\n`;
@@ -520,10 +526,10 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
       const country = Object.entries(COUNTRIES).find(([, v]) => v.id === a.country_id);
       const flag = country ? country[1].flag : '🏖️';
       if (a.tour_id) {
-        text += `${i + 1}. 🏨 *${a.tour_name || 'Hotel #' + a.tour_id}*\n`;
-        text += `   ${flag} ${a.country_name || 'Destinație'}\n`;
+        text += `${i + 1}. 🏨 *${esc(a.tour_name || 'Hotel #' + a.tour_id)}*\n`;
+        text += `   ${flag} ${esc(a.country_name || 'Destinație')}\n`;
       } else {
-        text += `${i + 1}. ${flag} *${a.country_name || 'Destinație'}*\n`;
+        text += `${i + 1}. ${flag} *${esc(a.country_name || 'Destinație')}*\n`;
       }
       text += `   📅 ${a.check_in} | 🌙 ${a.nights} nopți\n`;
       text += `   👥 ${a.adults} adulți${a.children_ages ? ' + copii ' + a.children_ages : ''}\n`;
@@ -868,7 +874,7 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
     const top = allOffers.slice(0, 3);
     top.forEach((offer, i) => {
       const medal = ['🥇', '🥈', '🥉'][i];
-      text += `${medal} *${offer.name}*\n`;
+      text += `${medal} *${esc(offer.name)}*\n`;
       text += `   💰 ${offer.price} ${alert.currency.toUpperCase()}/pers\n`;
       if (offer.stars) text += `   ⭐ ${offer.stars} stele\n`;
       text += `\n`;
@@ -916,8 +922,8 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
     const direction = isDecrease ? 'scăzut' : 'crescut';
 
     let text = `🔔 *Alertă preț hotel!*\n\n`;
-    text += `🏨 *${hotelName}*\n`;
-    text += `${flag} ${alert.country_name}\n\n`;
+    text += `🏨 *${esc(hotelName)}*\n`;
+    text += `${flag} ${esc(alert.country_name)}\n\n`;
 
     if (oldPrice) {
       text += `${arrow} Prețul a *${direction}*:\n`;
