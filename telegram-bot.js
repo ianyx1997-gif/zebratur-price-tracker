@@ -227,7 +227,7 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
         const nights = parseInt(parts[3]) || 7;
         const people = parts[4] || '2';
         const stars = parts[5] !== '0' ? parseInt(parts[5]) : null;
-        const food = parts[6] !== 'any' ? parts[6] : null;
+        const food = parts[6] !== 'any' ? parts[6].replace(/-/g, ',') : null; // dash back to comma (ai-uai -> ai,uai)
         const maxPrice = parts[7] ? parseInt(parts[7]) : null;
         const transport = parts[8] || 'air';
 
@@ -747,8 +747,7 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
         disable_web_page_preview: true,
         reply_markup: {
           inline_keyboard: [[
-            { text: '🔗 Vezi oferte', url: link },
-            { text: '📞 Sună acum', url: `tel:${AGENCY.phone.replace(/\s/g, '')}` }
+            { text: '🔗 Vezi oferte', url: link }
           ]]
         }
       });
