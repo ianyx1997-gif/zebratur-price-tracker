@@ -1172,6 +1172,37 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
     return people;
   }
 
+  // ===== BROADCAST MESSAGE TO ALL USERS =====
+  async function broadcastMessage(text, options = {}) {
+    const allUsers = db.prepare('SELECT DISTINCT chat_id FROM telegram_users').all();
+    console.log(`[Broadcast] Sending to ${allUsers.length} users...`);
+
+    let sent = 0, failed = 0, blocked = 0;
+    for (const user of allUsers) {
+      try {
+        await bot.sendMessage(user.chat_id, text, {
+          parse_mode: 'HTML',
+          disable_web_page_preview: options.disablePreview || false
+        });
+        sent++;
+        // Small delay to avoid Telegram rate limits (max ~30 msg/sec)
+        await new Promise(r => setTimeout(r, 50));
+      } catch (err) {
+        if (err.response && (err.response.statusCode === 403 || err.response.statusCode === 400)) {
+          // User blocked the bot or chat not found
+          blocked++;
+          console.log(`[Broadcast] User ${user.chat_id} blocked bot or invalid chat`);
+        } else {
+          failed++;
+          console.error(`[Broadcast] Failed for ${user.chat_id}:`, err.message);
+        }
+      }
+    }
+
+    console.log(`[Broadcast] Done: ${sent} sent, ${blocked} blocked, ${failed} failed`);
+    return { total: allUsers.length, sent, blocked, failed };
+  }
+
   // ===== RETURN BOT INTERFACE =====
   return {
     bot,
@@ -1179,6 +1210,7 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
     stmts,
     sendTelegramPriceAlert,
     sendTelegramHotelAlert,
+    broadcastMessage,
   };
 }
 

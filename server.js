@@ -524,6 +524,7 @@ async function checkAllPrices() {
         }
       }
 
+      // Random delay between groups (5-15s) — looks like natural browsing, not a bot
       // Small delay between search groups to avoid rate limiting
       await new Promise(r => setTimeout(r, 2000));
     } catch (err) {
@@ -798,6 +799,34 @@ app.get('/api/telegram-stats', (req, res) => {
       activeAlerts: alerts.count
     });
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Telegram broadcast — send promotional message to all bot users
+// POST /api/broadcast { message: "...", secret: "..." }
+app.post('/api/broadcast', async (req, res) => {
+  try {
+    const { message, secret } = req.body;
+
+    // Simple secret key to prevent unauthorized broadcasts
+    const BROADCAST_SECRET = process.env.BROADCAST_SECRET || 'zebra2024';
+    if (secret !== BROADCAST_SECRET) {
+      return res.status(403).json({ error: 'Invalid secret' });
+    }
+
+    if (!message || message.trim().length === 0) {
+      return res.status(400).json({ error: 'Message is required' });
+    }
+
+    if (!telegramBot || !telegramBot.broadcastMessage) {
+      return res.status(500).json({ error: 'Telegram bot not available' });
+    }
+
+    const result = await telegramBot.broadcastMessage(message.trim());
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error('[Broadcast] Error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
