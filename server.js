@@ -596,6 +596,166 @@ console.log(`[Cron] Price check scheduled: ${cronExpr} (every ${intervalMinutes}
 
 // ===== API ROUTES =====
 
+// Admin broadcast page — served directly from the server (no CORS issues)
+app.get('/admin', (req, res) => {
+  const telegramUsers = telegramBot ? telegramBot.stmts.getUserCount.get().count : 0;
+  const telegramAlerts = telegramBot ? telegramBot.stmts.getActiveAlertCount.get().count : 0;
+
+  res.send(`<!DOCTYPE html>
+<html lang="ro">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ZebraTur Admin — Broadcast Telegram</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f1f5f9;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+  .container{background:#fff;border-radius:16px;box-shadow:0 4px 24px rgba(0,0,0,0.08);max-width:520px;width:100%;overflow:hidden}
+  .header{background:linear-gradient(135deg,#0088cc,#006da3);padding:24px 28px;display:flex;align-items:center;gap:12px}
+  .header svg{flex-shrink:0}
+  .header h1{color:#fff;font-size:18px;font-weight:700}
+  .header p{color:rgba(255,255,255,0.8);font-size:13px;margin-top:2px}
+  .body{padding:28px}
+  .field{margin-bottom:20px}
+  .field label{display:block;font-size:13px;font-weight:600;color:#374151;margin-bottom:6px}
+  .field textarea{width:100%;min-height:140px;padding:12px 14px;border:2px solid #e2e8f0;border-radius:10px;font-size:14px;font-family:inherit;resize:vertical;outline:none;transition:border-color 0.2s}
+  .field textarea:focus{border-color:#0088cc}
+  .field input[type="password"]{width:100%;padding:10px 14px;border:2px solid #e2e8f0;border-radius:10px;font-size:14px;font-family:inherit;outline:none;transition:border-color 0.2s}
+  .field input[type="password"]:focus{border-color:#0088cc}
+  .hint{font-size:11.5px;color:#94a3b8;margin-top:6px;line-height:1.4}
+  .preview-toggle{font-size:12px;color:#0088cc;cursor:pointer;margin-top:8px;display:inline-block}
+  .preview-toggle:hover{text-decoration:underline}
+  .preview-box{display:none;margin-top:10px;padding:14px;background:#f8fafc;border-radius:10px;border:1px solid #e2e8f0;font-size:14px;line-height:1.5;color:#1e293b}
+  .preview-box.show{display:block}
+  .send-btn{width:100%;padding:14px;border:none;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;background:linear-gradient(135deg,#0088cc,#006da3);color:#fff;transition:all 0.2s;display:flex;align-items:center;justify-content:center;gap:8px}
+  .send-btn:hover{transform:translateY(-1px);box-shadow:0 4px 16px rgba(0,136,204,0.3)}
+  .send-btn:disabled{opacity:0.6;cursor:not-allowed;transform:none;box-shadow:none}
+  .result{margin-top:16px;padding:14px;border-radius:10px;font-size:13px;line-height:1.5;display:none}
+  .result.success{display:block;background:#f0fdf4;border:1px solid #bbf7d0;color:#166534}
+  .result.error{display:block;background:#fef2f2;border:1px solid #fecaca;color:#991b1b}
+  .stats{padding:14px;background:#f8fafc;border-radius:10px;border:1px solid #e2e8f0;margin-bottom:20px}
+  .stats-row{display:flex;justify-content:space-between;font-size:13px;color:#475569;padding:4px 0}
+  .stats-row span:last-child{font-weight:600;color:#1e293b}
+  .templates{margin-bottom:20px}
+  .templates label{display:block;font-size:13px;font-weight:600;color:#374151;margin-bottom:8px}
+  .template-btns{display:flex;gap:6px;flex-wrap:wrap}
+  .template-btn{padding:6px 12px;border:1px solid #e2e8f0;border-radius:8px;background:#f8fafc;font-size:12px;cursor:pointer;transition:all 0.15s;color:#475569}
+  .template-btn:hover{border-color:#0088cc;color:#0088cc;background:#f0f9ff}
+  @keyframes spin{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <svg viewBox="0 0 24 24" width="32" height="32" fill="white"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm4.64 6.8c-.15 1.58-.8 5.42-1.13 7.19-.14.75-.42 1-.68 1.03-.58.05-1.02-.38-1.58-.75-.88-.58-1.38-.94-2.23-1.5-.99-.65-.35-1.01.22-1.59.15-.15 2.71-2.48 2.76-2.69a.2.2 0 00-.05-.18c-.06-.05-.14-.03-.21-.02-.09.02-1.49.95-4.22 2.79-.4.27-.76.41-1.08.4-.36-.01-1.04-.2-1.55-.37-.63-.2-1.12-.31-1.08-.66.02-.18.27-.36.74-.55 2.92-1.27 4.86-2.11 5.83-2.51 2.78-1.16 3.35-1.36 3.73-1.36.08 0 .27.02.39.12.1.08.13.19.14.27-.01.06.01.24 0 .38z"/></svg>
+    <div>
+      <h1>Broadcast Telegram</h1>
+      <p>Trimite mesaje la toti urmaritorii</p>
+    </div>
+  </div>
+  <div class="body">
+    <div class="stats">
+      <div class="stats-row"><span>Utilizatori Telegram:</span> <span>${telegramUsers}</span></div>
+      <div class="stats-row"><span>Alerte active:</span> <span>${telegramAlerts}</span></div>
+    </div>
+
+    <div class="templates">
+      <label>Sabloane rapide:</label>
+      <div class="template-btns">
+        <button class="template-btn" onclick="useTemplate('discount')">Reducere %</button>
+        <button class="template-btn" onclick="useTemplate('lastminute')">Last Minute</button>
+        <button class="template-btn" onclick="useTemplate('earlybook')">Early Booking</button>
+        <button class="template-btn" onclick="useTemplate('custom')">Mesaj liber</button>
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="message">Mesajul (suporta HTML: &lt;b&gt;, &lt;i&gt;, &lt;a href&gt;):</label>
+      <textarea id="message" placeholder="Scrie mesajul aici..."></textarea>
+      <div class="hint">Foloseste \\n pentru linie noua. Tag-uri HTML: &lt;b&gt;bold&lt;/b&gt;, &lt;i&gt;italic&lt;/i&gt;, &lt;a href=&quot;url&quot;&gt;link&lt;/a&gt;</div>
+      <span class="preview-toggle" onclick="togglePreview()">Previzualizeaza mesajul</span>
+      <div class="preview-box" id="previewBox"></div>
+    </div>
+
+    <div class="field">
+      <label for="secret">Parola de acces:</label>
+      <input type="password" id="secret" placeholder="Introdu parola..." />
+    </div>
+
+    <button class="send-btn" id="sendBtn" onclick="sendBroadcast()">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+      Trimite la toti
+    </button>
+
+    <div class="result" id="resultBox"></div>
+  </div>
+</div>
+
+<script>
+  var templates = {
+    discount: '\\ud83c\\udf89 <b>Oferta speciala ZebraTur!</b>\\n\\n\\ud83d\\udd25 Oferim <b>5% reducere</b> la orice tur rezervat in urmatoarele <b>24 ore</b>!\\n\\nGrabeste-te, oferta e limitata!\\n\\n\\ud83d\\udcde Suna acum: 078 326 222\\n\\ud83c\\udf10 zebratur.md',
+    lastminute: '\\u2708\\ufe0f <b>Last Minute!</b>\\n\\n\\ud83c\\udfd6 Tururi cu reduceri de pana la <b>40%</b> pentru plecari in urmatoarele 7 zile!\\n\\nLocuri limitate \\u2014 rezerva acum!\\n\\n\\ud83d\\udcde 078 326 222\\n\\ud83c\\udf10 zebratur.md',
+    earlybook: '\\ud83c\\udf1f <b>Early Booking 2026!</b>\\n\\n\\ud83c\\udf34 Rezerva vacanta de vara cu <b>reduceri de pana la 35%</b>!\\n\\nPerioda limitata. Profita acum!\\n\\n\\ud83d\\udcde 078 326 222\\n\\ud83c\\udf10 zebratur.md',
+    custom: ''
+  };
+  function useTemplate(name) {
+    document.getElementById('message').value = templates[name] || '';
+    if (name === 'custom') document.getElementById('message').focus();
+  }
+  function togglePreview() {
+    var box = document.getElementById('previewBox');
+    box.classList.toggle('show');
+    if (box.classList.contains('show')) {
+      var html = document.getElementById('message').value.replace(/\\\\n/g, '<br>');
+      box.innerHTML = html || '<em style="color:#94a3b8">Mesajul e gol</em>';
+    }
+  }
+  function sendBroadcast() {
+    var message = document.getElementById('message').value.trim();
+    var secret = document.getElementById('secret').value.trim();
+    var btn = document.getElementById('sendBtn');
+    var resultBox = document.getElementById('resultBox');
+    if (!message) { alert('Scrie un mesaj!'); return; }
+    if (!secret) { alert('Introdu parola de acces!'); return; }
+    if (!confirm('Esti sigur ca vrei sa trimiti acest mesaj la TOTI urmaritorii?')) return;
+    btn.disabled = true;
+    btn.innerHTML = '<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" style="animation:spin 1s linear infinite"><path d="M12 4V2A10 10 0 0 0 2 12h2a8 8 0 0 1 8-8z"/></svg> Se trimite...';
+    resultBox.className = 'result';
+    fetch('/api/broadcast', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: message, secret: secret })
+    })
+    .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+    .then(function(res) {
+      if (res.ok && res.data.success) {
+        resultBox.className = 'result success';
+        resultBox.innerHTML = '<b>\\u2705 Mesaj trimis cu succes!</b><br>Total: ' + res.data.total + ' | Trimise: ' + res.data.sent + ' | Blocati: ' + res.data.blocked + ' | Erori: ' + res.data.failed;
+      } else {
+        resultBox.className = 'result error';
+        resultBox.innerHTML = '<b>\\u274c Eroare:</b> ' + (res.data.error || 'Ceva nu a mers');
+      }
+    })
+    .catch(function(err) {
+      resultBox.className = 'result error';
+      resultBox.innerHTML = '<b>\\u274c Eroare de conexiune:</b> ' + err.message;
+    })
+    .finally(function() {
+      btn.disabled = false;
+      btn.innerHTML = '<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg> Trimite la toti';
+    });
+  }
+  document.getElementById('message').addEventListener('input', function() {
+    var box = document.getElementById('previewBox');
+    if (box.classList.contains('show')) {
+      box.innerHTML = this.value.replace(/\\\\n/g, '<br>') || '<em style="color:#94a3b8">Mesajul e gol</em>';
+    }
+  });
+</script>
+</body>
+</html>`);
+});
+
 // Health check
 app.get('/', (req, res) => {
   const watcherCount = db.prepare('SELECT COUNT(*) as count FROM watchers WHERE active = 1').get();
