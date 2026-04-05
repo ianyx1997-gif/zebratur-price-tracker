@@ -242,8 +242,9 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
     // Extract search params (same data the email flow gets)
     const countryId = parseInt(sp.countryId) || 0;
     const deptCityId = parseInt(sp.deptCity) || 1831;
-    const checkIn = sp.checkIn || null;
-    const nights = parseInt(sp.length) || 7;
+    // Use offer-specific date/nights if available, fallback to search params
+    const checkIn = d.offerDate || sp.checkIn || null;
+    const nights = d.offerNights || parseInt(sp.length) || 7;
     const people = sp.people || '2';
     const stars = sp.stars ? parseInt(sp.stars) : null;
     const food = sp.food || null;
