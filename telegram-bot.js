@@ -1117,12 +1117,13 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
       // Price didn't change enough — skip
       if (Math.abs(changePct) < 3) return;
 
-      // Cooldown: don't notify more than once per 4 hours
-      if (alert.last_notified) {
-        const lastNotif = new Date(alert.last_notified).getTime();
-        const cooldown = 4 * 60 * 60 * 1000;
-        if (Date.now() - lastNotif < cooldown) return;
-      }
+      // Cooldown disabled for testing — every 3%+ change sends alert immediately
+      // TODO: re-enable for production (e.g. 4 * 60 * 60 * 1000 = 4 hours)
+      // if (alert.last_notified) {
+      //   const lastNotif = new Date(alert.last_notified).getTime();
+      //   const cooldown = 4 * 60 * 60 * 1000;
+      //   if (Date.now() - lastNotif < cooldown) return;
+      // }
 
       console.log(`[Telegram] Hotel ${tourIdStr} (${alert.tour_name}): ${oldPrice} → ${newPrice} (${changePct > 0 ? '+' : ''}${changePct.toFixed(1)}%) — sending alert`);
       await sendTelegramHotelAlert(alert, oldPrice, newPrice, changePct, hotelData);
