@@ -1,6 +1,6 @@
 /* ============================================================
    ZEBRATUR – PRICE TRACKER SERVER
-   Node.js backend for tracking tour prices & sending email alerts
+   Node.js backend for tracking tour prices & sending email/telegram alerts
    Deploy on Railway, Render, or any Node.js hosting
    ============================================================ */
 
@@ -12,6 +12,7 @@ const nodemailer = require('nodemailer');
 const Database = require('better-sqlite3');
 const fetch = require('node-fetch');
 const path = require('path');
+const { initTelegramBot } = require('./telegram-bot');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -551,14 +552,35 @@ async function checkAllPrices() {
   console.log(`[PriceCheck] Done. Checked: ${checked}, Alerts sent: ${alerts}`);
 }
 
+// ===== TELEGRAM BOT =====
+const telegramBot = initTelegramBot(db, searchPrices, AGENCY);
+if (telegramBot) {
+  console.log('[Telegram] Bot initialized successfully');
+}
+
 // ===== CRON SCHEDULE =====
-// Search API is async + heavy — check every 30 min by default (not every minute)
-const intervalMinutes = parseInt(process.env.CHECK_INTERVAL_MINUTES) || 30;
+const intervalMinutes = parseInt(process.env.CHECK_INTERVAL_MINUTES) || 1;
 const cronExpr = intervalMinutes >= 60
   ? `0 */${Math.floor(intervalMinutes / 60)} * * *`
   : `*/${intervalMinutes} * * * *`;
-cron.schedule(cronExpr, () => {
-  checkAllPrices();
+
+// Lock to prevent overlapping checks (search API can take 30-60s)
+let isChecking = false;
+cron.schedule(cronExpr, async () => {
+  if (isChecking) {
+    console.log('[Cron] Previous check still running, skipping this tick');
+    return;
+  }
+  isChecking = true;
+  try {
+    await checkAllPrices();
+    // Also check Telegram alerts
+    if (telegramBot) {
+      await telegramBot.checkTelegramAlerts();
+    }
+  } finally {
+    isChecking = false;
+  }
 });
 console.log(`[Cron] Price check scheduled: ${cronExpr} (every ${intervalMinutes}min)`);
 
@@ -567,12 +589,19 @@ console.log(`[Cron] Price check scheduled: ${cronExpr} (every ${intervalMinutes}
 // Health check
 app.get('/', (req, res) => {
   const watcherCount = db.prepare('SELECT COUNT(*) as count FROM watchers WHERE active = 1').get();
+  const telegramStats = telegramBot ? {
+    telegramEnabled: true,
+    telegramUsers: telegramBot.stmts.getUserCount.get().count,
+    telegramAlerts: telegramBot.stmts.getActiveAlertCount.get().count,
+  } : { telegramEnabled: false };
+
   res.json({
     status: 'ok',
     service: `${AGENCY.name} Price Tracker`,
     activeWatchers: watcherCount.count,
     checkInterval: `${intervalMinutes}min`,
-    threshold: `${THRESHOLD}%`
+    threshold: `${THRESHOLD}%`,
+    ...telegramStats
   });
 });
 
@@ -714,7 +743,26 @@ app.get('/api/price-history/:tourId', (req, res) => {
 app.post('/api/check-now', async (req, res) => {
   try {
     await checkAllPrices();
-    res.json({ success: true, message: 'Price check completed' });
+    if (telegramBot) {
+      await telegramBot.checkTelegramAlerts();
+    }
+    res.json({ success: true, message: 'Price check completed (email + telegram)' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Telegram stats
+app.get('/api/telegram-stats', (req, res) => {
+  if (!telegramBot) return res.json({ enabled: false });
+  try {
+    const users = telegramBot.stmts.getUserCount.get();
+    const alerts = telegramBot.stmts.getActiveAlertCount.get();
+    res.json({
+      enabled: true,
+      users: users.count,
+      activeAlerts: alerts.count
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
