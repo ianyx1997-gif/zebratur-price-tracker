@@ -510,7 +510,7 @@ async function checkAllPrices() {
           if (Math.abs(changePct) >= THRESHOLD) {
             if (watcher.last_notified) {
               const lastNotif = new Date(watcher.last_notified).getTime();
-              const cooldownMs = (parseInt(process.env.NOTIFICATION_COOLDOWN_MINUTES) || 5) * 60 * 1000;
+              const cooldownMs = (parseInt(process.env.NOTIFICATION_COOLDOWN_MINUTES) || 1440) * 60 * 1000;
               if (lastNotif > Date.now() - cooldownMs) {
                 console.log(`[PriceCheck] Skipping notification for ${watcher.email} (notified recently, cooldown ${cooldownMs/60000}min)`);
                 continue;
@@ -548,7 +548,7 @@ async function checkAllPrices() {
       if (Math.abs(changePct) >= THRESHOLD) {
         if (watcher.last_notified) {
           const lastNotif = new Date(watcher.last_notified).getTime();
-          const cooldownMs = (parseInt(process.env.NOTIFICATION_COOLDOWN_MINUTES) || 5) * 60 * 1000;
+          const cooldownMs = (parseInt(process.env.NOTIFICATION_COOLDOWN_MINUTES) || 1440) * 60 * 1000;
           if (lastNotif > Date.now() - cooldownMs) continue;
         }
         await sendPriceAlert(watcher, oldPrice, newPrice, changePct);
@@ -569,10 +569,8 @@ if (telegramBot) {
 }
 
 // ===== CRON SCHEDULE =====
-const intervalMinutes = parseInt(process.env.CHECK_INTERVAL_MINUTES) || 1;
-const cronExpr = intervalMinutes >= 60
-  ? `0 */${Math.floor(intervalMinutes / 60)} * * *`
-  : `*/${intervalMinutes} * * * *`;
+// Production: check once per day at 10:00 Moldova time (07:00 UTC)
+const cronExpr = process.env.CRON_SCHEDULE || '0 7 * * *';
 
 // Lock to prevent overlapping checks (search API can take 30-60s)
 let isChecking = false;
@@ -592,7 +590,7 @@ cron.schedule(cronExpr, async () => {
     isChecking = false;
   }
 });
-console.log(`[Cron] Price check scheduled: ${cronExpr} (every ${intervalMinutes}min)`);
+console.log(`[Cron] Price check scheduled: ${cronExpr} (daily at 10:00 Moldova time)`);
 
 // ===== API ROUTES =====
 
