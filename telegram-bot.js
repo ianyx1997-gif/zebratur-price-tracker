@@ -302,12 +302,14 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
       }
 
       // Build link: use tour URL if specific hotel, otherwise destination search
-      const link = d.tourUrl || buildZebraturLink({
+      // Fix page=map → page=tour so link opens tour details, not the map
+      let link = d.tourUrl || buildZebraturLink({
         country_id: countryId, dept_city_id: deptCityId,
         check_in: checkIn, check_to: checkTo,
         nights, adults, children_ages: childrenAges,
         stars, food, max_price: maxPrice, currency: 'eur', transport
       });
+      link = link.replace(/&page=map/, '&page=tour').replace(/&page=form/, '&page=tour');
 
       let summary = `✅ *Alertă setată de pe site!*\n\n`;
       if (d.tourName) {
@@ -536,7 +538,7 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
       text += `   👥 ${a.adults} adulți${a.children_ages ? ' + copii ' + a.children_ages : ''}\n`;
       if (a.max_price) text += `   💰 Max: ${a.max_price} ${a.currency}\n`;
       if (a.last_best_price) text += `   📊 ${a.tour_id ? 'Preț actual' : 'Cel mai bun preț'}: *${a.last_best_price} ${a.currency}*\n`;
-      if (a.tour_url) text += `   🔗 [Vezi hotelul](${a.tour_url})\n`;
+      if (a.tour_url) text += `   🔗 [Vezi hotelul](${a.tour_url.replace(/&page=map/, '&page=tour').replace(/&page=form/, '&page=tour')})\n`;
       text += `   🆔 ID: ${a.id}\n\n`;
     });
     text += `Pentru a opri o alertă: /stop`;
@@ -922,7 +924,9 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
     const flag = country ? country[1].flag : '🏖️';
     // Use the specific hotel URL if available (stored from pre-registration, like email)
     // Fall back to destination search link only if tour_url is missing
-    const link = alert.tour_url || buildZebraturLink(alert);
+    // Always fix page=map → page=tour so link opens tour details, not the map
+    let link = alert.tour_url || buildZebraturLink(alert);
+    link = link.replace(/&page=map/, '&page=tour').replace(/&page=form/, '&page=tour');
     const hotelName = alert.tour_name || hotelData.name || `Hotel #${alert.tour_id}`;
 
     const isDecrease = newPrice < oldPrice;
