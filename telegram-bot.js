@@ -217,7 +217,8 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
     link += `&rt=0,10&th=&e=`;
     link += `&r=${alert.transport || 'air'}`;
     link += `&ex=1&cu=${alert.currency || 'eur'}`;
-    link += `&page=form`;
+    // page=tour shows tour details list; page=form shows the search form; avoid page=map
+    link += `&page=tour`;
     return link;
   }
 
@@ -889,9 +890,10 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
         parse_mode: 'Markdown',
         disable_web_page_preview: true,
         reply_markup: {
-          inline_keyboard: [[
-            { text: '🔗 Vezi oferte', url: link }
-          ]]
+          inline_keyboard: [
+            [{ text: '🔗 Vezi oferte', url: link }],
+            [{ text: '💬 Contactează agentul', url: 'https://t.me/Zebraturbot' }]
+          ]
         }
       });
       stmts.markAlertNotified.run(alert.id);
@@ -909,6 +911,12 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
   // ===== SEND SPECIFIC HOTEL PRICE ALERT =====
   // Used when alert has tour_id (from website deep link) — tracks ONE hotel
   // Uses tour_url (specific hotel link) just like email notifications do
+  // HTML-safe escape for Telegram HTML parse mode
+  function escHtml(text) {
+    if (!text) return '';
+    return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
   async function sendTelegramHotelAlert(alert, oldPrice, newPrice, changePct, hotelData) {
     const country = Object.entries(COUNTRIES).find(([, v]) => v.id === alert.country_id);
     const flag = country ? country[1].flag : '🏖️';
@@ -921,16 +929,16 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
     const arrow = isDecrease ? '📉' : '📈';
     const direction = isDecrease ? 'scăzut' : 'crescut';
 
-    let text = `🔔 *Alertă preț hotel!*\n\n`;
-    text += `🏨 *${esc(hotelName)}*\n`;
-    text += `${flag} ${esc(alert.country_name)}\n\n`;
+    let text = `🔔 <b>Alertă preț hotel!</b>\n\n`;
+    text += `🏨 <b>${escHtml(hotelName)}</b>\n`;
+    text += `${flag} ${escHtml(alert.country_name)}\n\n`;
 
     if (oldPrice) {
-      text += `${arrow} Prețul a *${direction}*:\n`;
-      text += `   ~${oldPrice.toFixed(0)}~ → *${newPrice.toFixed(0)} ${(alert.currency || 'eur').toUpperCase()}*/pers\n`;
+      text += `${arrow} Prețul a <b>${direction}</b>:\n`;
+      text += `   <s>${oldPrice.toFixed(0)}</s> → <b>${newPrice.toFixed(0)} ${(alert.currency || 'eur').toUpperCase()}</b>/pers\n`;
       text += `   ${changePct > 0 ? '+' : ''}${changePct.toFixed(1)}%\n\n`;
     } else {
-      text += `💰 Preț actual: *${newPrice.toFixed(0)} ${(alert.currency || 'eur').toUpperCase()}*/pers\n\n`;
+      text += `💰 Preț actual: <b>${newPrice.toFixed(0)} ${(alert.currency || 'eur').toUpperCase()}</b>/pers\n\n`;
     }
 
     text += `📅 ${alert.check_in} | 🌙 ${alert.nights} nopți | 👥 ${alert.adults} pers\n`;
@@ -939,12 +947,13 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
 
     try {
       await bot.sendMessage(alert.chat_id, text, {
-        parse_mode: 'Markdown',
+        parse_mode: 'HTML',
         disable_web_page_preview: true,
         reply_markup: {
-          inline_keyboard: [[
-            { text: '🔗 Vezi oferta', url: link }
-          ]]
+          inline_keyboard: [
+            [{ text: '🔗 Vezi oferta', url: link }],
+            [{ text: '💬 Contactează agentul', url: 'https://t.me/Zebraturbot' }]
+          ]
         }
       });
       stmts.markAlertNotified.run(alert.id);
@@ -1110,19 +1119,49 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
       }
 
       const oldPrice = alert.last_best_price;
-      stmts.updateAlertPrice.run(newPrice, hotelData.name || tourIdStr, alert.id);
 
-      // Calculate change %
-      const changePct = oldPrice ? ((newPrice - oldPrice) / oldPrice) * 100 : 0;
+      // === ANTI FALSE-ALERT LOGIC ===
+      // API returns different offers each poll (different operators/rooms/flights)
+      // causing small price fluctuations that aren't real changes.
+      // Strategy: only alert if the new price is CONSISTENTLY different —
+      // we store current price but only alert vs the CONFIRMED baseline price.
+      // A price becomes "confirmed" after 2+ consecutive checks at that level.
 
-      // No previous price — just record, don't alert
-      if (!oldPrice) {
-        console.log(`[Telegram] Hotel ${tourIdStr}: first price recorded ${newPrice} EUR`);
+      // Round prices to nearest integer to avoid floating point noise
+      const roundedNew = Math.round(newPrice);
+      const roundedOld = oldPrice ? Math.round(oldPrice) : null;
+
+      // If price hasn't changed meaningfully (within 2% band), just update last_checked
+      if (roundedOld && Math.abs(roundedNew - roundedOld) / roundedOld < 0.02) {
+        // Price is essentially the same — just update timestamp, don't change stored price
+        stmts.updateAlertPrice.run(roundedOld, hotelData.name || tourIdStr, alert.id);
         return;
       }
 
-      // Price didn't change enough — skip
-      if (Math.abs(changePct) < 3) return;
+      // Price IS different — but is it a real change or API noise?
+      // Only update stored price if it moved significantly (>2%)
+      stmts.updateAlertPrice.run(roundedNew, hotelData.name || tourIdStr, alert.id);
+
+      // Calculate change %
+      const changePct = roundedOld ? ((roundedNew - roundedOld) / roundedOld) * 100 : 0;
+
+      // No previous price — just record, don't alert
+      if (!roundedOld) {
+        console.log(`[Telegram] Hotel ${tourIdStr}: first price recorded ${roundedNew} EUR`);
+        return;
+      }
+
+      // Price didn't change enough (min 3%) — skip
+      if (Math.abs(changePct) < 3) {
+        console.log(`[Telegram] Hotel ${tourIdStr}: minor change ${roundedOld} → ${roundedNew} (${changePct.toFixed(1)}%) — skipping`);
+        return;
+      }
+
+      // Ignore unrealistic spikes (>60% change) — likely API glitch or different room type
+      if (Math.abs(changePct) > 60) {
+        console.log(`[Telegram] Hotel ${tourIdStr}: ignoring unrealistic change ${roundedOld} → ${roundedNew} (${changePct.toFixed(1)}%)`);
+        return;
+      }
 
       // Cooldown: max 1 notification per 24 hours per alert
       if (alert.last_notified) {
@@ -1144,14 +1183,21 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
     if (relevantOffers.length === 0) return;
 
     const bestOffer = relevantOffers[0];
-    const bestPrice = bestOffer.price;
+    const bestPrice = Math.round(bestOffer.price);
+    const prevPrice = alert.last_best_price ? Math.round(alert.last_best_price) : null;
+
+    // If price within 2% band — same price, just update timestamp
+    if (prevPrice && Math.abs(bestPrice - prevPrice) / prevPrice < 0.02) {
+      stmts.updateAlertPrice.run(prevPrice, bestOffer.name || bestOffer.id, alert.id);
+      return;
+    }
 
     stmts.updateAlertPrice.run(bestPrice, bestOffer.name || bestOffer.id, alert.id);
 
-    // Notify if: first check, or price dropped significantly
+    // Notify only if price dropped significantly (>3%)
     const shouldNotify =
-      !alert.last_best_price ||
-      (bestPrice < alert.last_best_price * 0.97) ||
+      !prevPrice ||
+      (bestPrice < prevPrice * 0.97) ||
       (!alert.last_notified);
 
     // Cooldown: don't notify more than once per 6 hours

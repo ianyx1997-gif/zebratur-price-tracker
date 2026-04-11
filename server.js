@@ -961,6 +961,65 @@ app.get('/api/telegram-stats', (req, res) => {
   }
 });
 
+// Admin: detailed view of all Telegram users and their alerts
+app.get('/api/telegram-details', (req, res) => {
+  const secret = req.query.secret;
+  const BROADCAST_SECRET = process.env.BROADCAST_SECRET || 'zebra2024';
+  if (secret !== BROADCAST_SECRET) {
+    return res.status(403).json({ error: 'Invalid secret. Use ?secret=YOUR_SECRET' });
+  }
+  if (!telegramBot) return res.json({ enabled: false });
+  try {
+    const users = db.prepare(`SELECT * FROM telegram_users ORDER BY last_active DESC`).all();
+    const alerts = db.prepare(`SELECT * FROM telegram_alerts WHERE active = 1 ORDER BY chat_id, created_at DESC`).all();
+
+    const userMap = {};
+    users.forEach(u => {
+      userMap[u.chat_id] = {
+        chat_id: u.chat_id,
+        username: u.username,
+        first_name: u.first_name,
+        last_name: u.last_name,
+        joined_at: u.joined_at,
+        last_active: u.last_active,
+        alerts: []
+      };
+    });
+
+    alerts.forEach(a => {
+      const target = userMap[a.chat_id] || { chat_id: a.chat_id, username: 'unknown', alerts: [] };
+      if (!userMap[a.chat_id]) userMap[a.chat_id] = target;
+      target.alerts.push({
+        id: a.id,
+        country: a.country_name,
+        dept_city: a.dept_city_name,
+        check_in: a.check_in,
+        check_to: a.check_to,
+        nights: a.nights,
+        adults: a.adults,
+        stars: a.stars,
+        food: a.food,
+        max_price: a.max_price,
+        currency: a.currency,
+        transport: a.transport,
+        tour_name: a.tour_name,
+        last_best_price: a.last_best_price,
+        last_best_hotel: a.last_best_hotel,
+        last_checked: a.last_checked,
+        created_at: a.created_at
+      });
+    });
+
+    res.json({
+      total_users: users.length,
+      total_active_alerts: alerts.length,
+      users: Object.values(userMap)
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Telegram broadcast — send promotional message to all bot users
 // POST /api/broadcast { message: "...", secret: "..." }
 app.post('/api/broadcast', async (req, res) => {
