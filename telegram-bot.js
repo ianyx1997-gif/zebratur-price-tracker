@@ -123,6 +123,22 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
       alerts_count INTEGER DEFAULT 0
     );
 
+    CREATE TABLE IF NOT EXISTS telegram_price_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      alert_id INTEGER NOT NULL,
+      price REAL NOT NULL,
+      hotel_name TEXT,
+      recorded_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS telegram_messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      chat_id INTEGER NOT NULL,
+      direction TEXT NOT NULL,
+      message TEXT,
+      sent_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
     CREATE TABLE IF NOT EXISTS telegram_subscriptions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       chat_id INTEGER NOT NULL,
@@ -183,12 +199,34 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
     getActiveSubscriptions: db.prepare(`SELECT * FROM telegram_subscriptions WHERE subscription_type = ? AND active = 1`),
     getAllSubscriptions: db.prepare(`SELECT * FROM telegram_subscriptions WHERE active = 1`),
     getSubscriptionCount: db.prepare(`SELECT COUNT(*) as count FROM telegram_subscriptions WHERE active = 1`),
+    // Price history
+    insertPriceHistory: db.prepare(`INSERT INTO telegram_price_history (alert_id, price, hotel_name) VALUES (?, ?, ?)`),
+    getPriceHistory: db.prepare(`SELECT * FROM telegram_price_history WHERE alert_id = ? ORDER BY recorded_at ASC`),
+    getPriceHistoryAll: db.prepare(`SELECT * FROM telegram_price_history ORDER BY recorded_at ASC`),
+    // Messages
+    insertMessage: db.prepare(`INSERT INTO telegram_messages (chat_id, direction, message) VALUES (?, ?, ?)`),
+    getMessagesByChat: db.prepare(`SELECT * FROM telegram_messages WHERE chat_id = ? ORDER BY sent_at DESC LIMIT 50`),
   };
 
   // ===== HELPER: Track user =====
   function trackUser(msg) {
     const { chat, from } = msg;
     stmts.upsertUser.run(chat.id, from?.username || null, from?.first_name || null, from?.last_name || null);
+  }
+
+  // ===== LOG ALL INCOMING MESSAGES =====
+  bot.on('message', (msg) => {
+    if (!msg.text) return;
+    try {
+      stmts.insertMessage.run(msg.chat.id, 'in', msg.text.substring(0, 2000));
+    } catch(e) { /* ignore logging errors */ }
+  });
+
+  // ===== HELPER: Log outgoing admin message =====
+  function logOutgoingMessage(chatId, text) {
+    try {
+      stmts.insertMessage.run(chatId, 'out', (text || '').substring(0, 2000));
+    } catch(e) { /* ignore */ }
   }
 
   // ===== HELPER: Parse date from Romanian text =====
@@ -1375,11 +1413,15 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
       // Only update stored price if it moved significantly (>2%)
       stmts.updateAlertPrice.run(roundedNew, hotelData.name || tourIdStr, alert.id);
 
+      // Log price history for dashboard tracking
+      try { stmts.insertPriceHistory.run(alert.id, roundedNew, hotelData.name || tourIdStr); } catch(e) { /* ignore */ }
+
       // Calculate change %
       const changePct = roundedOld ? ((roundedNew - roundedOld) / roundedOld) * 100 : 0;
 
-      // No previous price — just record, don't alert
+      // No previous price — just record initial price, don't alert
       if (!roundedOld) {
+        try { stmts.insertPriceHistory.run(alert.id, roundedNew, hotelData.name || tourIdStr); } catch(e) { /* ignore */ }
         console.log(`[Telegram] Hotel ${tourIdStr}: first price recorded ${roundedNew} EUR`);
         return;
       }
@@ -1426,6 +1468,9 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
     }
 
     stmts.updateAlertPrice.run(bestPrice, bestOffer.name || bestOffer.id, alert.id);
+
+    // Log price history
+    try { stmts.insertPriceHistory.run(alert.id, bestPrice, bestOffer.name || bestOffer.id); } catch(e) { /* ignore */ }
 
     // Notify only if price dropped significantly (>3%)
     const shouldNotify =

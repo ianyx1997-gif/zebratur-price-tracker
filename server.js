@@ -793,10 +793,77 @@ app.get('/admin/dashboard', (req, res) => {
   const alerts = db.prepare('SELECT * FROM telegram_alerts WHERE active = 1 ORDER BY created_at DESC').all();
   let subscriptions = [];
   try { subscriptions = db.prepare('SELECT * FROM telegram_subscriptions WHERE active = 1').all(); } catch(e) { /* table might not exist yet */ }
+  let priceHistory = [];
+  try { priceHistory = db.prepare('SELECT * FROM telegram_price_history ORDER BY recorded_at ASC').all(); } catch(e) { /* table might not exist yet */ }
 
   const totalUsers = users.length;
   const totalAlerts = alerts.length;
   const totalSubs = subscriptions.length;
+
+  // Index price history by alert_id
+  const historyByAlert = {};
+  priceHistory.forEach(h => {
+    if (!historyByAlert[h.alert_id]) historyByAlert[h.alert_id] = [];
+    historyByAlert[h.alert_id].push(h);
+  });
+
+  // Helper: build link for an alert (same logic as telegram-bot buildZebraturLink)
+  function buildAlertLink(a) {
+    if (a.tour_url) {
+      return a.tour_url.replace(/&page=map/, '&page=tour').replace(/&page=form/, '&page=tour');
+    }
+    let link = 'https://zebratur.md/test#!i=' + a.country_id;
+    link += '&c=' + (a.check_in || '') + '&v=' + (a.check_to || a.check_in || '');
+    link += '&l=' + (a.nights || 7);
+    link += '&p=' + (a.adults || 2);
+    link += '&d=' + (a.dept_city_id || 1831);
+    link += '&o=' + (a.food || '') + '&st=' + (a.stars || '');
+    link += '&r=' + (a.transport || 'air') + '&cu=' + (a.currency || 'eur');
+    link += '&page=tour';
+    return link;
+  }
+
+  // Helper: build SVG sparkline for price history
+  function buildSparkline(history, currency) {
+    if (!history || history.length < 2) return '';
+    const prices = history.map(h => h.price);
+    const minP = Math.min(...prices);
+    const maxP = Math.max(...prices);
+    const range = maxP - minP || 1;
+    const w = 140, h = 36, pad = 2;
+    const stepX = (w - pad * 2) / (prices.length - 1);
+
+    let points = '';
+    let circles = '';
+    prices.forEach((p, i) => {
+      const x = pad + i * stepX;
+      const y = pad + (1 - (p - minP) / range) * (h - pad * 2);
+      points += (i === 0 ? 'M' : 'L') + x.toFixed(1) + ',' + y.toFixed(1);
+      // Show dot on last point
+      if (i === prices.length - 1) {
+        circles = '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="2.5" fill="#0088cc"/>';
+      }
+    });
+
+    const firstP = prices[0];
+    const lastP = prices[prices.length - 1];
+    const trend = lastP < firstP ? '#059669' : (lastP > firstP ? '#dc2626' : '#64748b');
+    const pctChange = firstP > 0 ? ((lastP - firstP) / firstP * 100).toFixed(1) : '0';
+    const arrow = lastP < firstP ? '↓' : (lastP > firstP ? '↑' : '→');
+
+    // Build date labels
+    const firstDate = history[0].recorded_at ? history[0].recorded_at.substring(5, 10) : '';
+    const lastDate = history[history.length - 1].recorded_at ? history[history.length - 1].recorded_at.substring(5, 10) : '';
+
+    return '<div class="sparkline-wrap">' +
+      '<svg width="' + w + '" height="' + h + '" class="sparkline"><path d="' + points + '" fill="none" stroke="' + trend + '" stroke-width="1.5" stroke-linecap="round"/>' + circles + '</svg>' +
+      '<div class="spark-info">' +
+        '<span class="spark-range">' + Math.round(minP) + '–' + Math.round(maxP) + ' ' + (currency || 'EUR').toUpperCase() + '</span>' +
+        '<span class="spark-trend" style="color:' + trend + '">' + arrow + ' ' + pctChange + '%</span>' +
+        '<span class="spark-dates">' + firstDate + ' → ' + lastDate + '</span>' +
+      '</div>' +
+    '</div>';
+  }
 
   // Build user cards HTML
   let userCardsHtml = '';
@@ -822,12 +889,28 @@ app.get('/admin/dashboard', (req, res) => {
       const tourLabel = a.tour_name ? a.tour_name.substring(0, 45) : (a.country_name || 'N/A');
       const priceInfo = a.last_best_price ? Math.round(a.last_best_price) + ' ' + (a.currency || 'EUR').toUpperCase() : '—';
       const checkedAgo = a.last_checked ? timeAgo(new Date(a.last_checked)) : 'niciodată';
-      alertsHtml += '<div class="alert-row">' +
-        '<span class="alert-dest">' + escH(tourLabel) + '</span>' +
-        '<span class="alert-price">' + priceInfo + '</span>' +
-        '<span class="alert-date">' + (a.check_in || '') + '</span>' +
-        '<span class="alert-checked">Verificat: ' + checkedAgo + '</span>' +
-        '</div>';
+      const alertLink = buildAlertLink(a);
+      const history = historyByAlert[a.id] || [];
+      const sparkline = buildSparkline(history, a.currency);
+      const createdDate = a.created_at ? a.created_at.substring(0, 10) : '';
+
+      alertsHtml += '<div class="alert-card">' +
+        '<div class="alert-top">' +
+          '<a href="' + escH(alertLink) + '" target="_blank" class="alert-link" title="Deschide oferta">' + escH(tourLabel) + ' ↗</a>' +
+          '<span class="alert-price">' + priceInfo + '</span>' +
+        '</div>' +
+        '<div class="alert-meta-row">' +
+          '<span>📅 ' + (a.check_in || '—') + '</span>' +
+          '<span>🌙 ' + (a.nights || 7) + ' nopți</span>' +
+          '<span>👥 ' + (a.adults || 2) + ' pers</span>' +
+          (a.food ? '<span>🍽️ ' + a.food.toUpperCase() + '</span>' : '') +
+          (a.stars ? '<span>⭐' + a.stars + '</span>' : '') +
+        '</div>' +
+        '<div class="alert-bottom">' +
+          (sparkline || '<span class="no-history">Niciun istoric încă</span>') +
+          '<span class="alert-dates">Abonat: ' + createdDate + ' · Verificat: ' + checkedAgo + '</span>' +
+        '</div>' +
+      '</div>';
     });
 
     let subsHtml = '';
@@ -888,11 +971,21 @@ app.get('/admin/dashboard', (req, res) => {
   .badge-sub{background:#dbeafe;color:#1e40af}
   .alerts-section,.subs-section{padding:12px 20px}
   .section-title{font-size:12px;font-weight:600;color:#64748b;margin-bottom:8px}
-  .alert-row{display:flex;gap:12px;align-items:center;padding:6px 0;border-bottom:1px solid #f8fafc;font-size:13px;flex-wrap:wrap}
-  .alert-dest{font-weight:500;color:#1e293b;flex:1;min-width:120px}
-  .alert-price{color:#059669;font-weight:600;min-width:80px}
-  .alert-date{color:#94a3b8;font-size:12px;min-width:80px}
-  .alert-checked{color:#94a3b8;font-size:11px}
+  .alert-card{background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:12px 14px;margin-bottom:8px}
+  .alert-top{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px}
+  .alert-link{font-weight:600;color:#0088cc;text-decoration:none;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+  .alert-link:hover{text-decoration:underline;color:#006da3}
+  .alert-price{color:#059669;font-weight:700;font-size:14px;white-space:nowrap}
+  .alert-meta-row{display:flex;gap:10px;font-size:11px;color:#64748b;flex-wrap:wrap;margin-bottom:8px}
+  .alert-bottom{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+  .sparkline-wrap{display:flex;align-items:center;gap:8px}
+  .sparkline{flex-shrink:0}
+  .spark-info{display:flex;flex-direction:column;gap:1px}
+  .spark-range{font-size:11px;color:#475569;font-weight:500}
+  .spark-trend{font-size:11px;font-weight:600}
+  .spark-dates{font-size:10px;color:#94a3b8}
+  .no-history{font-size:11px;color:#94a3b8;font-style:italic}
+  .alert-dates{font-size:10px;color:#94a3b8;margin-left:auto}
   .sub-row{display:flex;gap:12px;padding:4px 0;font-size:13px}
   .sub-type{font-weight:500;color:#1e293b}
   .sub-dest{color:#64748b}
@@ -901,22 +994,32 @@ app.get('/admin/dashboard', (req, res) => {
   .msg-btn:hover{border-color:#0088cc;color:#0088cc;background:#f0f9ff}
   .modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:1000;align-items:center;justify-content:center}
   .modal-overlay.show{display:flex}
-  .modal{background:#fff;border-radius:16px;box-shadow:0 8px 40px rgba(0,0,0,0.15);max-width:480px;width:90%;overflow:hidden}
-  .modal-header{background:linear-gradient(135deg,#0088cc,#006da3);padding:18px 24px;color:#fff}
+  .modal{background:#fff;border-radius:16px;box-shadow:0 8px 40px rgba(0,0,0,0.15);max-width:520px;width:92%;overflow:hidden;display:flex;flex-direction:column;max-height:85vh}
+  .modal-header{background:linear-gradient(135deg,#0088cc,#006da3);padding:16px 24px;color:#fff;flex-shrink:0}
   .modal-header h3{font-size:16px;font-weight:600}
   .modal-header p{font-size:12px;opacity:0.8;margin-top:2px}
-  .modal-body{padding:20px 24px}
-  .modal-body textarea{width:100%;min-height:120px;padding:12px;border:2px solid #e2e8f0;border-radius:10px;font-size:14px;font-family:inherit;resize:vertical;outline:none}
-  .modal-body textarea:focus{border-color:#0088cc}
-  .modal-body .hint{font-size:11px;color:#94a3b8;margin-top:6px}
-  .modal-actions{display:flex;gap:8px;padding:0 24px 20px;justify-content:flex-end}
-  .modal-actions button{padding:10px 20px;border-radius:10px;font-size:14px;font-weight:600;cursor:pointer;border:none;transition:all 0.15s}
-  .btn-cancel{background:#f1f5f9;color:#475569}
-  .btn-cancel:hover{background:#e2e8f0}
-  .btn-send{background:linear-gradient(135deg,#0088cc,#006da3);color:#fff}
+  .chat-history{flex:1;overflow-y:auto;padding:16px 20px;background:#f8fafc;min-height:200px;max-height:360px}
+  .chat-loading,.chat-empty{text-align:center;color:#94a3b8;font-size:13px;padding:40px 0;font-style:italic}
+  .chat-date-sep{text-align:center;font-size:11px;color:#94a3b8;margin:12px 0 8px;position:relative}
+  .chat-date-sep::before,.chat-date-sep::after{content:'';position:absolute;top:50%;width:30%;height:1px;background:#e2e8f0}
+  .chat-date-sep::before{left:0}
+  .chat-date-sep::after{right:0}
+  .chat-bubble{max-width:85%;margin-bottom:8px;padding:8px 12px;border-radius:12px;font-size:13px;line-height:1.4;word-break:break-word}
+  .chat-in{background:#fff;border:1px solid #e2e8f0;margin-right:auto;border-bottom-left-radius:4px}
+  .chat-out{background:#0088cc;color:#fff;margin-left:auto;border-bottom-right-radius:4px}
+  .bubble-label{font-size:10px;opacity:0.6;margin-bottom:3px;font-weight:500}
+  .bubble-text{white-space:pre-wrap}
+  .chat-compose{display:flex;gap:8px;padding:12px 20px;border-top:1px solid #e2e8f0;flex-shrink:0;align-items:flex-end}
+  .chat-compose textarea{flex:1;padding:8px 12px;border:2px solid #e2e8f0;border-radius:10px;font-size:13px;font-family:inherit;resize:none;outline:none;min-height:38px;max-height:80px}
+  .chat-compose textarea:focus{border-color:#0088cc}
+  .btn-send{padding:8px 16px;border-radius:10px;font-size:13px;font-weight:600;cursor:pointer;border:none;background:linear-gradient(135deg,#0088cc,#006da3);color:#fff;white-space:nowrap;height:38px}
   .btn-send:hover{opacity:0.9}
   .btn-send:disabled{opacity:0.5;cursor:not-allowed}
-  .msg-result{margin:0 24px 16px;padding:10px;border-radius:8px;font-size:13px;display:none}
+  .modal-actions{display:flex;gap:8px;padding:8px 20px 16px;justify-content:space-between;align-items:center;flex-shrink:0}
+  .modal-actions .hint{font-size:10px;color:#94a3b8}
+  .btn-cancel{padding:8px 16px;border-radius:10px;font-size:13px;font-weight:600;cursor:pointer;border:none;background:#f1f5f9;color:#475569}
+  .btn-cancel:hover{background:#e2e8f0}
+  .msg-result{margin:0 20px 8px;padding:8px 12px;border-radius:8px;font-size:12px;display:none;flex-shrink:0}
   .msg-result.ok{display:block;background:#f0fdf4;border:1px solid #bbf7d0;color:#166534}
   .msg-result.err{display:block;background:#fef2f2;border:1px solid #fecaca;color:#991b1b}
   @media(max-width:600px){.stats-grid{grid-template-columns:1fr}.user-header{flex-wrap:wrap}.alert-row{flex-direction:column;gap:2px}}
@@ -947,17 +1050,20 @@ app.get('/admin/dashboard', (req, res) => {
 <div class="modal-overlay" id="msgModal">
   <div class="modal">
     <div class="modal-header">
-      <h3 id="modalTitle">Trimite mesaj</h3>
+      <h3 id="modalTitle">Conversație</h3>
       <p id="modalSubtitle"></p>
     </div>
-    <div class="modal-body">
-      <textarea id="msgText" placeholder="Scrie mesajul aici..."></textarea>
-      <div class="hint">Suportă HTML: &lt;b&gt;bold&lt;/b&gt;, &lt;i&gt;italic&lt;/i&gt;, &lt;a href="url"&gt;link&lt;/a&gt;</div>
+    <div class="chat-history" id="chatHistory">
+      <div class="chat-loading">Se încarcă...</div>
+    </div>
+    <div class="chat-compose">
+      <textarea id="msgText" placeholder="Scrie mesajul aici..." rows="2"></textarea>
+      <button class="btn-send" id="sendBtn" onclick="sendMsg()">Trimite ➤</button>
     </div>
     <div class="msg-result" id="msgResult"></div>
     <div class="modal-actions">
-      <button class="btn-cancel" onclick="closeMsg()">Anulează</button>
-      <button class="btn-send" id="sendBtn" onclick="sendMsg()">Trimite</button>
+      <div class="hint">HTML: &lt;b&gt;bold&lt;/b&gt;, &lt;i&gt;italic&lt;/i&gt;, &lt;a href="url"&gt;link&lt;/a&gt;</div>
+      <button class="btn-cancel" onclick="closeMsg()">Închide</button>
     </div>
   </div>
 </div>
@@ -968,12 +1074,12 @@ var dashSecret = '${escH(secret)}';
 
 function openMsg(chatId, name) {
   currentChatId = chatId;
-  document.getElementById('modalTitle').textContent = 'Trimite mesaj lui ' + name;
+  document.getElementById('modalTitle').textContent = name;
   document.getElementById('modalSubtitle').textContent = 'Chat ID: ' + chatId;
   document.getElementById('msgText').value = '';
   document.getElementById('msgResult').className = 'msg-result';
   document.getElementById('msgModal').classList.add('show');
-  document.getElementById('msgText').focus();
+  loadChatHistory(chatId);
 }
 
 function closeMsg() {
@@ -985,9 +1091,49 @@ document.getElementById('msgModal').addEventListener('click', function(e) {
   if (e.target === this) closeMsg();
 });
 
+function loadChatHistory(chatId) {
+  var container = document.getElementById('chatHistory');
+  container.innerHTML = '<div class="chat-loading">Se încarcă...</div>';
+
+  fetch('/api/chat-history/' + chatId + '?secret=' + encodeURIComponent(dashSecret))
+  .then(function(r) { return r.json(); })
+  .then(function(data) {
+    var msgs = data.messages || [];
+    if (msgs.length === 0) {
+      container.innerHTML = '<div class="chat-empty">Niciun mesaj încă. Trimite primul mesaj!</div>';
+      return;
+    }
+    var html = '';
+    var lastDate = '';
+    msgs.forEach(function(m) {
+      var date = (m.sent_at || '').substring(0, 10);
+      if (date !== lastDate) {
+        html += '<div class="chat-date-sep">' + date + '</div>';
+        lastDate = date;
+      }
+      var time = (m.sent_at || '').substring(11, 16);
+      var isOut = m.direction === 'out';
+      var cls = isOut ? 'chat-bubble chat-out' : 'chat-bubble chat-in';
+      var label = isOut ? 'Tu (admin)' : 'Client';
+      var msgText = m.message || '';
+      // Escape HTML for display but preserve line breaks
+      msgText = msgText.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\\n/g,'<br>');
+      html += '<div class="' + cls + '">' +
+        '<div class="bubble-label">' + label + ' · ' + time + '</div>' +
+        '<div class="bubble-text">' + msgText + '</div>' +
+      '</div>';
+    });
+    container.innerHTML = html;
+    container.scrollTop = container.scrollHeight;
+  })
+  .catch(function() {
+    container.innerHTML = '<div class="chat-empty">Eroare la încărcarea istoricului</div>';
+  });
+}
+
 function sendMsg() {
   var text = document.getElementById('msgText').value.trim();
-  if (!text) { alert('Scrie un mesaj!'); return; }
+  if (!text) return;
   var btn = document.getElementById('sendBtn');
   var result = document.getElementById('msgResult');
   btn.disabled = true;
@@ -1003,8 +1149,11 @@ function sendMsg() {
   .then(function(res) {
     if (res.ok && res.data.success) {
       result.className = 'msg-result ok';
-      result.textContent = 'Mesaj trimis cu succes!';
-      setTimeout(closeMsg, 1500);
+      result.textContent = 'Trimis!';
+      document.getElementById('msgText').value = '';
+      // Reload history to show the sent message
+      loadChatHistory(currentChatId);
+      setTimeout(function() { result.className = 'msg-result'; }, 2000);
     } else {
       result.className = 'msg-result err';
       result.textContent = res.data.error || 'Eroare la trimitere';
@@ -1012,13 +1161,21 @@ function sendMsg() {
   })
   .catch(function(err) {
     result.className = 'msg-result err';
-    result.textContent = 'Eroare de conexiune: ' + err.message;
+    result.textContent = 'Eroare: ' + err.message;
   })
   .finally(function() {
     btn.disabled = false;
-    btn.textContent = 'Trimite';
+    btn.textContent = 'Trimite ➤';
   });
 }
+
+// Send on Ctrl+Enter
+document.getElementById('msgText').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+    e.preventDefault();
+    sendMsg();
+  }
+});
 </script>
 </body>
 </html>`);
@@ -1281,6 +1438,8 @@ app.get('/api/telegram-details', (req, res) => {
     alerts.forEach(a => {
       const target = userMap[a.chat_id] || { chat_id: a.chat_id, username: 'unknown', alerts: [], subscriptions: [] };
       if (!userMap[a.chat_id]) userMap[a.chat_id] = target;
+      let alertHistory = [];
+      try { alertHistory = db.prepare('SELECT price, recorded_at FROM telegram_price_history WHERE alert_id = ? ORDER BY recorded_at ASC').all(a.id); } catch(e) {}
       target.alerts.push({
         id: a.id,
         country: a.country_name,
@@ -1295,10 +1454,12 @@ app.get('/api/telegram-details', (req, res) => {
         currency: a.currency,
         transport: a.transport,
         tour_name: a.tour_name,
+        tour_url: a.tour_url,
         last_best_price: a.last_best_price,
         last_best_hotel: a.last_best_hotel,
         last_checked: a.last_checked,
-        created_at: a.created_at
+        created_at: a.created_at,
+        price_history: alertHistory
       });
     });
 
@@ -1342,6 +1503,8 @@ app.post('/api/send-direct', async (req, res) => {
       parse_mode: 'HTML',
       disable_web_page_preview: false
     });
+    // Log the outgoing message
+    try { db.prepare('INSERT INTO telegram_messages (chat_id, direction, message) VALUES (?, ?, ?)').run(chat_id, 'out', message.trim().substring(0, 2000)); } catch(e) { /* ignore */ }
     res.json({ success: true, chat_id });
   } catch (err) {
     console.error('[DirectMsg] Error:', err.message);
@@ -1350,6 +1513,21 @@ app.post('/api/send-direct', async (req, res) => {
     } else {
       res.status(500).json({ error: err.message });
     }
+  }
+});
+
+// Admin: get chat history with a user
+app.get('/api/chat-history/:chatId', (req, res) => {
+  const secret = req.query.secret;
+  const BROADCAST_SECRET = process.env.BROADCAST_SECRET || 'zebra2024';
+  if (secret !== BROADCAST_SECRET) {
+    return res.status(403).json({ error: 'Invalid secret' });
+  }
+  try {
+    const messages = db.prepare('SELECT * FROM telegram_messages WHERE chat_id = ? ORDER BY sent_at DESC LIMIT 50').all(parseInt(req.params.chatId));
+    res.json({ messages: messages.reverse() }); // oldest first
+  } catch(e) {
+    res.json({ messages: [] });
   }
 });
 
