@@ -308,6 +308,25 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
     return d.toISOString().split('T')[0];
   }
 
+  // Parse search date formats: "DD.MM.YYYY", "YYYY-MM-DD", "DD/MM/YYYY"
+  function parseSearchDate(str) {
+    if (!str) return null;
+    // DD.MM.YYYY or DD/MM/YYYY
+    const dmy = str.match(/(\d{1,2})[.\/](\d{1,2})[.\/](\d{4})/);
+    if (dmy) return new Date(parseInt(dmy[3]), parseInt(dmy[2]) - 1, parseInt(dmy[1]));
+    // YYYY-MM-DD
+    const ymd = str.match(/(\d{4})-(\d{2})-(\d{2})/);
+    if (ymd) return new Date(parseInt(ymd[1]), parseInt(ymd[2]) - 1, parseInt(ymd[3]));
+    return null;
+  }
+
+  // Format date as DD.MM.YYYY (Otpusk search format)
+  function fmtSearchDate(d) {
+    return d.getDate().toString().padStart(2, '0') + '.' +
+      (d.getMonth() + 1).toString().padStart(2, '0') + '.' +
+      d.getFullYear();
+  }
+
   // ===== HELPER: Create alert from pre-registered token data =====
   // This is the NEW flow — frontend pre-registers all tour data, bot just looks it up
   function handleTokenPayload(msg, name, token) {
@@ -330,8 +349,31 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
     const countryId = parseInt(sp.countryId) || 0;
     const deptCityId = parseInt(sp.deptCity) || 1831;
     // Use offer-specific date/nights if available, fallback to search params
+    // IMPORTANT: offerDate is the ACTUAL tour departure date (e.g., 2 June)
+    // while sp.checkIn is the search engine date (e.g., 1 June) — they often differ!
     const checkIn = d.offerDate || sp.checkIn || null;
     const nights = d.offerNights || parseInt(sp.length) || 7;
+
+    // Override searchParams dates with offer-specific dates so API searches
+    // for the exact departure date, not the search form date
+    if (d.offerDate && sp.checkIn !== d.offerDate) {
+      console.log(`[Telegram] Overriding search date: ${sp.checkIn} → ${d.offerDate} (offer-specific)`);
+      sp.checkIn = d.offerDate;
+      // Narrow the search window: offerDate + 3 days max (to find this exact departure)
+      if (d.offerDate) {
+        try {
+          const offerDateObj = parseSearchDate(d.offerDate);
+          if (offerDateObj) {
+            const checkToDate = new Date(offerDateObj.getTime() + 3 * 86400000);
+            sp.checkTo = fmtSearchDate(checkToDate);
+          }
+        } catch(e) { /* keep original checkTo */ }
+      }
+    }
+    if (d.offerNights && sp.length !== String(d.offerNights)) {
+      console.log(`[Telegram] Overriding search nights: ${sp.length} → ${d.offerNights} (offer-specific)`);
+      sp.length = String(d.offerNights);
+    }
     const people = sp.people || '2';
     const stars = sp.stars ? parseInt(sp.stars) : null;
     const food = sp.food || null;
@@ -1325,6 +1367,22 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
       for (const alert of withSearchParams) {
         try {
           const sp = JSON.parse(alert.search_params);
+
+          // FIX: Use the alert's actual check_in date (from offer) instead of
+          // the search engine date stored in search_params.
+          // The search form date (sp.checkIn) and the tour's actual date (alert.check_in)
+          // can differ by 1-3 days, causing false price alerts.
+          if (alert.check_in && alert.tour_id) {
+            const alertDate = parseSearchDate(alert.check_in) || parseSearchDate(sp.checkIn);
+            const spDate = parseSearchDate(sp.checkIn);
+            if (alertDate && spDate && alertDate.getTime() !== spDate.getTime()) {
+              sp.checkIn = fmtSearchDate(alertDate);
+              // Narrow search window to ±2 days around offer date
+              const checkToDate = new Date(alertDate.getTime() + 3 * 86400000);
+              sp.checkTo = fmtSearchDate(checkToDate);
+            }
+          }
+
           const key = JSON.stringify({
             countryId: sp.countryId,
             checkIn: sp.checkIn,
