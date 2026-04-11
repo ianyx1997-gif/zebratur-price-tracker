@@ -846,6 +846,7 @@ app.get('/admin/dashboard', (req, res) => {
         '<div class="user-badges">' +
           (userAlerts.length > 0 ? '<span class="badge badge-alert">' + userAlerts.length + ' alerte</span>' : '') +
           (userSubs.length > 0 ? '<span class="badge badge-sub">' + userSubs.length + ' abon.</span>' : '') +
+          '<button class="msg-btn" onclick="openMsg(' + u.chat_id + ',\'' + escH(name).replace(/'/g, "\\'") + '\')">✉️</button>' +
         '</div>' +
       '</div>' +
       (alertsHtml ? '<div class="alerts-section"><div class="section-title">🔔 Alerte active</div>' + alertsHtml + '</div>' : '') +
@@ -896,6 +897,28 @@ app.get('/admin/dashboard', (req, res) => {
   .sub-type{font-weight:500;color:#1e293b}
   .sub-dest{color:#64748b}
   .empty-state{padding:12px 20px;color:#94a3b8;font-size:13px;font-style:italic}
+  .msg-btn{padding:4px 10px;border:1px solid #e2e8f0;border-radius:8px;background:#f8fafc;font-size:12px;cursor:pointer;transition:all 0.15s;color:#475569}
+  .msg-btn:hover{border-color:#0088cc;color:#0088cc;background:#f0f9ff}
+  .modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:1000;align-items:center;justify-content:center}
+  .modal-overlay.show{display:flex}
+  .modal{background:#fff;border-radius:16px;box-shadow:0 8px 40px rgba(0,0,0,0.15);max-width:480px;width:90%;overflow:hidden}
+  .modal-header{background:linear-gradient(135deg,#0088cc,#006da3);padding:18px 24px;color:#fff}
+  .modal-header h3{font-size:16px;font-weight:600}
+  .modal-header p{font-size:12px;opacity:0.8;margin-top:2px}
+  .modal-body{padding:20px 24px}
+  .modal-body textarea{width:100%;min-height:120px;padding:12px;border:2px solid #e2e8f0;border-radius:10px;font-size:14px;font-family:inherit;resize:vertical;outline:none}
+  .modal-body textarea:focus{border-color:#0088cc}
+  .modal-body .hint{font-size:11px;color:#94a3b8;margin-top:6px}
+  .modal-actions{display:flex;gap:8px;padding:0 24px 20px;justify-content:flex-end}
+  .modal-actions button{padding:10px 20px;border-radius:10px;font-size:14px;font-weight:600;cursor:pointer;border:none;transition:all 0.15s}
+  .btn-cancel{background:#f1f5f9;color:#475569}
+  .btn-cancel:hover{background:#e2e8f0}
+  .btn-send{background:linear-gradient(135deg,#0088cc,#006da3);color:#fff}
+  .btn-send:hover{opacity:0.9}
+  .btn-send:disabled{opacity:0.5;cursor:not-allowed}
+  .msg-result{margin:0 24px 16px;padding:10px;border-radius:8px;font-size:13px;display:none}
+  .msg-result.ok{display:block;background:#f0fdf4;border:1px solid #bbf7d0;color:#166534}
+  .msg-result.err{display:block;background:#fef2f2;border:1px solid #fecaca;color:#991b1b}
   @media(max-width:600px){.stats-grid{grid-template-columns:1fr}.user-header{flex-wrap:wrap}.alert-row{flex-direction:column;gap:2px}}
 </style>
 </head>
@@ -920,6 +943,83 @@ app.get('/admin/dashboard', (req, res) => {
 
   ${userCardsHtml || '<div class="user-card"><div class="empty-state">Niciun utilizator Telegram încă</div></div>'}
 </div>
+
+<div class="modal-overlay" id="msgModal">
+  <div class="modal">
+    <div class="modal-header">
+      <h3 id="modalTitle">Trimite mesaj</h3>
+      <p id="modalSubtitle"></p>
+    </div>
+    <div class="modal-body">
+      <textarea id="msgText" placeholder="Scrie mesajul aici..."></textarea>
+      <div class="hint">Suportă HTML: &lt;b&gt;bold&lt;/b&gt;, &lt;i&gt;italic&lt;/i&gt;, &lt;a href="url"&gt;link&lt;/a&gt;</div>
+    </div>
+    <div class="msg-result" id="msgResult"></div>
+    <div class="modal-actions">
+      <button class="btn-cancel" onclick="closeMsg()">Anulează</button>
+      <button class="btn-send" id="sendBtn" onclick="sendMsg()">Trimite</button>
+    </div>
+  </div>
+</div>
+
+<script>
+var currentChatId = null;
+var dashSecret = '${escH(secret)}';
+
+function openMsg(chatId, name) {
+  currentChatId = chatId;
+  document.getElementById('modalTitle').textContent = 'Trimite mesaj lui ' + name;
+  document.getElementById('modalSubtitle').textContent = 'Chat ID: ' + chatId;
+  document.getElementById('msgText').value = '';
+  document.getElementById('msgResult').className = 'msg-result';
+  document.getElementById('msgModal').classList.add('show');
+  document.getElementById('msgText').focus();
+}
+
+function closeMsg() {
+  document.getElementById('msgModal').classList.remove('show');
+  currentChatId = null;
+}
+
+document.getElementById('msgModal').addEventListener('click', function(e) {
+  if (e.target === this) closeMsg();
+});
+
+function sendMsg() {
+  var text = document.getElementById('msgText').value.trim();
+  if (!text) { alert('Scrie un mesaj!'); return; }
+  var btn = document.getElementById('sendBtn');
+  var result = document.getElementById('msgResult');
+  btn.disabled = true;
+  btn.textContent = 'Se trimite...';
+  result.className = 'msg-result';
+
+  fetch('/api/send-direct', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: currentChatId, message: text, secret: dashSecret })
+  })
+  .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+  .then(function(res) {
+    if (res.ok && res.data.success) {
+      result.className = 'msg-result ok';
+      result.textContent = 'Mesaj trimis cu succes!';
+      setTimeout(closeMsg, 1500);
+    } else {
+      result.className = 'msg-result err';
+      result.textContent = res.data.error || 'Eroare la trimitere';
+    }
+  })
+  .catch(function(err) {
+    result.className = 'msg-result err';
+    result.textContent = 'Eroare de conexiune: ' + err.message;
+  })
+  .finally(function() {
+    btn.disabled = false;
+    btn.textContent = 'Trimite';
+  });
+}
+</script>
 </body>
 </html>`);
 });
@@ -1221,6 +1321,35 @@ app.get('/api/telegram-details', (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin: send message to a specific Telegram user
+app.post('/api/send-direct', async (req, res) => {
+  try {
+    const { chat_id, message, secret } = req.body;
+    const BROADCAST_SECRET = process.env.BROADCAST_SECRET || 'zebra2024';
+    if (secret !== BROADCAST_SECRET) {
+      return res.status(403).json({ error: 'Invalid secret' });
+    }
+    if (!chat_id || !message || message.trim().length === 0) {
+      return res.status(400).json({ error: 'chat_id and message are required' });
+    }
+    if (!telegramBot) {
+      return res.status(500).json({ error: 'Telegram bot not available' });
+    }
+    await telegramBot.bot.sendMessage(chat_id, message.trim(), {
+      parse_mode: 'HTML',
+      disable_web_page_preview: false
+    });
+    res.json({ success: true, chat_id });
+  } catch (err) {
+    console.error('[DirectMsg] Error:', err.message);
+    if (err.response?.statusCode === 403) {
+      res.status(403).json({ error: 'Utilizatorul a blocat botul' });
+    } else {
+      res.status(500).json({ error: err.message });
+    }
   }
 });
 
