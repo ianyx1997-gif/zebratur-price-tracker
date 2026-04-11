@@ -592,12 +592,27 @@ cron.schedule(cronExpr, async () => {
 });
 console.log(`[Cron] Price check scheduled: ${cronExpr} (daily at 10:00 Moldova time)`);
 
+// Daily top deals cron — runs at 9:00 Moldova time (06:00 UTC)
+const topDealsCron = process.env.TOP_DEALS_CRON || '0 6 * * *';
+cron.schedule(topDealsCron, async () => {
+  if (!telegramBot || !telegramBot.sendDailyTopDeals) return;
+  try {
+    console.log('[Cron] Starting daily top deals...');
+    const result = await telegramBot.sendDailyTopDeals();
+    console.log(`[Cron] Daily top deals done: ${result.sent}/${result.total} sent`);
+  } catch (err) {
+    console.error('[Cron] Daily top deals error:', err.message);
+  }
+});
+console.log(`[Cron] Daily top deals scheduled: ${topDealsCron} (daily at 9:00 Moldova time)`);
+
 // ===== API ROUTES =====
 
 // Admin broadcast page — served directly from the server (no CORS issues)
 app.get('/admin', (req, res) => {
   const telegramUsers = telegramBot ? telegramBot.stmts.getUserCount.get().count : 0;
   const telegramAlerts = telegramBot ? telegramBot.stmts.getActiveAlertCount.get().count : 0;
+  const telegramSubs = telegramBot ? telegramBot.stmts.getSubscriptionCount.get().count : 0;
 
   res.send(`<!DOCTYPE html>
 <html lang="ro">
@@ -655,6 +670,8 @@ app.get('/admin', (req, res) => {
     <div class="stats">
       <div class="stats-row"><span>Utilizatori Telegram:</span> <span>${telegramUsers}</span></div>
       <div class="stats-row"><span>Alerte active:</span> <span>${telegramAlerts}</span></div>
+      <div class="stats-row"><span>Abonați Top Oferte:</span> <span>${telegramSubs}</span></div>
+      <div class="stats-row"><span></span> <span><a href="/admin/dashboard?secret=" style="color:#0088cc;font-size:12px;text-decoration:none" onclick="this.href='/admin/dashboard?secret='+document.getElementById('secret').value">📊 Dashboard complet</a></span></div>
     </div>
 
     <div class="templates">
@@ -753,6 +770,178 @@ app.get('/admin', (req, res) => {
 </body>
 </html>`);
 });
+
+// ===== ADMIN DASHBOARD — Full view of users, alerts, subscriptions =====
+app.get('/admin/dashboard', (req, res) => {
+  const secret = req.query.secret;
+  const BROADCAST_SECRET = process.env.BROADCAST_SECRET || 'zebra2024';
+  if (secret !== BROADCAST_SECRET) {
+    return res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>ZebraTur Dashboard</title>
+    <style>body{font-family:system-ui;display:flex;align-items:center;justify-content:center;min-height:100vh;background:#f1f5f9}
+    .login{background:#fff;padding:40px;border-radius:16px;box-shadow:0 4px 24px rgba(0,0,0,0.08);text-align:center;max-width:360px;width:100%}
+    h2{margin-bottom:16px;color:#1e293b}input{width:100%;padding:12px;border:2px solid #e2e8f0;border-radius:10px;font-size:14px;margin-bottom:12px;outline:none}
+    input:focus{border-color:#0088cc}button{width:100%;padding:12px;background:linear-gradient(135deg,#0088cc,#006da3);color:#fff;border:none;border-radius:10px;font-size:15px;font-weight:600;cursor:pointer}
+    button:hover{opacity:0.9}</style></head><body>
+    <div class="login"><h2>🔒 Dashboard ZebraTur</h2><form method="get"><input name="secret" type="password" placeholder="Parola de acces..." autofocus>
+    <button type="submit">Intră</button></form></div></body></html>`);
+  }
+
+  if (!telegramBot) return res.send('Telegram bot not enabled');
+
+  // Fetch all data
+  const users = db.prepare('SELECT * FROM telegram_users ORDER BY last_active DESC').all();
+  const alerts = db.prepare('SELECT * FROM telegram_alerts WHERE active = 1 ORDER BY created_at DESC').all();
+  let subscriptions = [];
+  try { subscriptions = db.prepare('SELECT * FROM telegram_subscriptions WHERE active = 1').all(); } catch(e) { /* table might not exist yet */ }
+
+  const totalUsers = users.length;
+  const totalAlerts = alerts.length;
+  const totalSubs = subscriptions.length;
+
+  // Build user cards HTML
+  let userCardsHtml = '';
+  const alertsByChat = {};
+  alerts.forEach(a => {
+    if (!alertsByChat[a.chat_id]) alertsByChat[a.chat_id] = [];
+    alertsByChat[a.chat_id].push(a);
+  });
+  const subsByChat = {};
+  subscriptions.forEach(s => {
+    if (!subsByChat[s.chat_id]) subsByChat[s.chat_id] = [];
+    subsByChat[s.chat_id].push(s);
+  });
+
+  users.forEach(u => {
+    const userAlerts = alertsByChat[u.chat_id] || [];
+    const userSubs = subsByChat[u.chat_id] || [];
+    const name = [u.first_name, u.last_name].filter(Boolean).join(' ') || 'Anonim';
+    const username = u.username ? '@' + u.username : '';
+
+    let alertsHtml = '';
+    userAlerts.forEach(a => {
+      const tourLabel = a.tour_name ? a.tour_name.substring(0, 45) : (a.country_name || 'N/A');
+      const priceInfo = a.last_best_price ? Math.round(a.last_best_price) + ' ' + (a.currency || 'EUR').toUpperCase() : '—';
+      const checkedAgo = a.last_checked ? timeAgo(new Date(a.last_checked)) : 'niciodată';
+      alertsHtml += '<div class="alert-row">' +
+        '<span class="alert-dest">' + escH(tourLabel) + '</span>' +
+        '<span class="alert-price">' + priceInfo + '</span>' +
+        '<span class="alert-date">' + (a.check_in || '') + '</span>' +
+        '<span class="alert-checked">Verificat: ' + checkedAgo + '</span>' +
+        '</div>';
+    });
+
+    let subsHtml = '';
+    userSubs.forEach(s => {
+      const destLabel = s.destinations === 'all' ? '🌍 Toate' : s.destinations.split(',').map(d => d.charAt(0).toUpperCase() + d.slice(1)).join(', ');
+      subsHtml += '<div class="sub-row"><span class="sub-type">📬 ' + escH(s.subscription_type) + '</span><span class="sub-dest">' + escH(destLabel) + '</span></div>';
+    });
+
+    userCardsHtml += '<div class="user-card">' +
+      '<div class="user-header">' +
+        '<div class="user-avatar">' + escH(name.charAt(0).toUpperCase()) + '</div>' +
+        '<div class="user-info">' +
+          '<div class="user-name">' + escH(name) + ' <span class="user-handle">' + escH(username) + '</span></div>' +
+          '<div class="user-meta">ID: ' + u.chat_id + ' · Activ: ' + timeAgo(new Date(u.last_active)) + '</div>' +
+        '</div>' +
+        '<div class="user-badges">' +
+          (userAlerts.length > 0 ? '<span class="badge badge-alert">' + userAlerts.length + ' alerte</span>' : '') +
+          (userSubs.length > 0 ? '<span class="badge badge-sub">' + userSubs.length + ' abon.</span>' : '') +
+        '</div>' +
+      '</div>' +
+      (alertsHtml ? '<div class="alerts-section"><div class="section-title">🔔 Alerte active</div>' + alertsHtml + '</div>' : '') +
+      (subsHtml ? '<div class="subs-section"><div class="section-title">📬 Abonamente</div>' + subsHtml + '</div>' : '') +
+      (!alertsHtml && !subsHtml ? '<div class="empty-state">Nicio alertă sau abonament activ</div>' : '') +
+    '</div>';
+  });
+
+  res.send(`<!DOCTYPE html>
+<html lang="ro">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ZebraTur Dashboard</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f1f5f9;min-height:100vh;padding:20px}
+  .dashboard{max-width:900px;margin:0 auto}
+  .dash-header{background:linear-gradient(135deg,#0088cc,#006da3);border-radius:16px;padding:28px 32px;margin-bottom:24px;color:#fff}
+  .dash-header h1{font-size:22px;font-weight:700;margin-bottom:4px}
+  .dash-header p{opacity:0.8;font-size:13px}
+  .stats-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:24px}
+  .stat-card{background:#fff;border-radius:12px;padding:20px;box-shadow:0 2px 12px rgba(0,0,0,0.06);text-align:center}
+  .stat-number{font-size:32px;font-weight:700;color:#0088cc}
+  .stat-label{font-size:13px;color:#64748b;margin-top:4px}
+  .nav-links{display:flex;gap:8px;margin-bottom:20px}
+  .nav-links a{padding:8px 16px;background:#fff;border-radius:8px;text-decoration:none;color:#475569;font-size:13px;font-weight:500;box-shadow:0 1px 4px rgba(0,0,0,0.06);transition:all 0.15s}
+  .nav-links a:hover{background:#0088cc;color:#fff}
+  .user-card{background:#fff;border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,0.06);margin-bottom:12px;overflow:hidden}
+  .user-header{display:flex;align-items:center;gap:12px;padding:16px 20px;border-bottom:1px solid #f1f5f9}
+  .user-avatar{width:40px;height:40px;border-radius:50%;background:linear-gradient(135deg,#0088cc,#38bdf8);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:16px;flex-shrink:0}
+  .user-info{flex:1;min-width:0}
+  .user-name{font-weight:600;color:#1e293b;font-size:14px}
+  .user-handle{color:#94a3b8;font-weight:400;font-size:12px}
+  .user-meta{font-size:11px;color:#94a3b8;margin-top:2px}
+  .user-badges{display:flex;gap:6px;flex-shrink:0}
+  .badge{padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600}
+  .badge-alert{background:#fef3c7;color:#92400e}
+  .badge-sub{background:#dbeafe;color:#1e40af}
+  .alerts-section,.subs-section{padding:12px 20px}
+  .section-title{font-size:12px;font-weight:600;color:#64748b;margin-bottom:8px}
+  .alert-row{display:flex;gap:12px;align-items:center;padding:6px 0;border-bottom:1px solid #f8fafc;font-size:13px;flex-wrap:wrap}
+  .alert-dest{font-weight:500;color:#1e293b;flex:1;min-width:120px}
+  .alert-price{color:#059669;font-weight:600;min-width:80px}
+  .alert-date{color:#94a3b8;font-size:12px;min-width:80px}
+  .alert-checked{color:#94a3b8;font-size:11px}
+  .sub-row{display:flex;gap:12px;padding:4px 0;font-size:13px}
+  .sub-type{font-weight:500;color:#1e293b}
+  .sub-dest{color:#64748b}
+  .empty-state{padding:12px 20px;color:#94a3b8;font-size:13px;font-style:italic}
+  @media(max-width:600px){.stats-grid{grid-template-columns:1fr}.user-header{flex-wrap:wrap}.alert-row{flex-direction:column;gap:2px}}
+</style>
+</head>
+<body>
+<div class="dashboard">
+  <div class="dash-header">
+    <h1>📊 ZebraTur Dashboard</h1>
+    <p>Telegram Bot — Utilizatori, Alerte & Abonamente</p>
+  </div>
+
+  <div class="stats-grid">
+    <div class="stat-card"><div class="stat-number">${totalUsers}</div><div class="stat-label">Utilizatori</div></div>
+    <div class="stat-card"><div class="stat-number">${totalAlerts}</div><div class="stat-label">Alerte Active</div></div>
+    <div class="stat-card"><div class="stat-number">${totalSubs}</div><div class="stat-label">Abonați Top Oferte</div></div>
+  </div>
+
+  <div class="nav-links">
+    <a href="/admin?secret=${encodeURIComponent(secret)}">📢 Broadcast</a>
+    <a href="/admin/dashboard?secret=${encodeURIComponent(secret)}">📊 Dashboard</a>
+    <a href="/api/telegram-details?secret=${encodeURIComponent(secret)}" target="_blank">📋 JSON API</a>
+  </div>
+
+  ${userCardsHtml || '<div class="user-card"><div class="empty-state">Niciun utilizator Telegram încă</div></div>'}
+</div>
+</body>
+</html>`);
+});
+
+// Helper: HTML-escape for server-side templates
+function escH(str) {
+  if (!str) return '';
+  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// Helper: human-readable time ago
+function timeAgo(date) {
+  const seconds = Math.floor((new Date() - date) / 1000);
+  if (seconds < 60) return 'acum';
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return minutes + ' min';
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return hours + ' ore';
+  const days = Math.floor(hours / 24);
+  if (days < 30) return days + ' zile';
+  return Math.floor(days / 30) + ' luni';
+}
 
 // Health check
 app.get('/', (req, res) => {
@@ -972,6 +1161,8 @@ app.get('/api/telegram-details', (req, res) => {
   try {
     const users = db.prepare(`SELECT * FROM telegram_users ORDER BY last_active DESC`).all();
     const alerts = db.prepare(`SELECT * FROM telegram_alerts WHERE active = 1 ORDER BY chat_id, created_at DESC`).all();
+    let subscriptions = [];
+    try { subscriptions = db.prepare(`SELECT * FROM telegram_subscriptions WHERE active = 1`).all(); } catch(e) { /* table may not exist */ }
 
     const userMap = {};
     users.forEach(u => {
@@ -982,12 +1173,13 @@ app.get('/api/telegram-details', (req, res) => {
         last_name: u.last_name,
         joined_at: u.joined_at,
         last_active: u.last_active,
-        alerts: []
+        alerts: [],
+        subscriptions: []
       };
     });
 
     alerts.forEach(a => {
-      const target = userMap[a.chat_id] || { chat_id: a.chat_id, username: 'unknown', alerts: [] };
+      const target = userMap[a.chat_id] || { chat_id: a.chat_id, username: 'unknown', alerts: [], subscriptions: [] };
       if (!userMap[a.chat_id]) userMap[a.chat_id] = target;
       target.alerts.push({
         id: a.id,
@@ -1010,12 +1202,43 @@ app.get('/api/telegram-details', (req, res) => {
       });
     });
 
+    subscriptions.forEach(s => {
+      const target = userMap[s.chat_id] || { chat_id: s.chat_id, username: 'unknown', alerts: [], subscriptions: [] };
+      if (!userMap[s.chat_id]) userMap[s.chat_id] = target;
+      target.subscriptions.push({
+        id: s.id,
+        type: s.subscription_type,
+        destinations: s.destinations,
+        created_at: s.created_at
+      });
+    });
+
     res.json({
       total_users: users.length,
       total_active_alerts: alerts.length,
+      total_subscriptions: subscriptions.length,
       users: Object.values(userMap)
     });
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin: manually trigger daily top deals
+app.post('/api/send-top-deals', async (req, res) => {
+  try {
+    const { secret } = req.body;
+    const BROADCAST_SECRET = process.env.BROADCAST_SECRET || 'zebra2024';
+    if (secret !== BROADCAST_SECRET) {
+      return res.status(403).json({ error: 'Invalid secret' });
+    }
+    if (!telegramBot || !telegramBot.sendDailyTopDeals) {
+      return res.status(500).json({ error: 'Telegram bot not available or sendDailyTopDeals not found' });
+    }
+    const result = await telegramBot.sendDailyTopDeals();
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error('[TopDeals API] Error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });

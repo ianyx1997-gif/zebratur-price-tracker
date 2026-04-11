@@ -6,6 +6,8 @@
    /start          — Bun venit + instrucțiuni
    /urmareste      — Setează alertă de preț (conversație ghidată)
    /ofertele_mele  — Listează alertele tale active
+   /topoferte      — Abonare la top oferte zilnice
+   /stop_topoferte — Dezabonare de la top oferte
    /stop           — Oprește o alertă specifică
    /help           — Ajutor
    ============================================================ */
@@ -120,6 +122,16 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
       last_active DATETIME DEFAULT CURRENT_TIMESTAMP,
       alerts_count INTEGER DEFAULT 0
     );
+
+    CREATE TABLE IF NOT EXISTS telegram_subscriptions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      chat_id INTEGER NOT NULL,
+      subscription_type TEXT NOT NULL DEFAULT 'daily_deals',
+      destinations TEXT,
+      active INTEGER DEFAULT 1,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(chat_id, subscription_type)
+    );
   `);
 
   // Migration: add columns for specific hotel tracking (like email watchers table)
@@ -158,6 +170,19 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
     updateAlertTourName: db.prepare(`UPDATE telegram_alerts SET tour_name = ? WHERE id = ?`),
     getUserCount: db.prepare(`SELECT COUNT(*) as count FROM telegram_users`),
     getActiveAlertCount: db.prepare(`SELECT COUNT(*) as count FROM telegram_alerts WHERE active = 1`),
+    // Subscriptions
+    upsertSubscription: db.prepare(`
+      INSERT INTO telegram_subscriptions (chat_id, subscription_type, destinations, active)
+      VALUES (?, ?, ?, 1)
+      ON CONFLICT(chat_id, subscription_type) DO UPDATE SET
+        destinations = excluded.destinations,
+        active = 1
+    `),
+    deactivateSubscription: db.prepare(`UPDATE telegram_subscriptions SET active = 0 WHERE chat_id = ? AND subscription_type = ?`),
+    getSubscription: db.prepare(`SELECT * FROM telegram_subscriptions WHERE chat_id = ? AND subscription_type = ? AND active = 1`),
+    getActiveSubscriptions: db.prepare(`SELECT * FROM telegram_subscriptions WHERE subscription_type = ? AND active = 1`),
+    getAllSubscriptions: db.prepare(`SELECT * FROM telegram_subscriptions WHERE active = 1`),
+    getSubscriptionCount: db.prepare(`SELECT COUNT(*) as count FROM telegram_subscriptions WHERE active = 1`),
   };
 
   // ===== HELPER: Track user =====
@@ -448,7 +473,9 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
       `📋 *Ce pot face:*\n` +
       `🔔 /urmareste — Setează o alertă de preț\n` +
       `📋 /ofertele\\_mele — Vezi alertele tale active\n` +
+      `🏆 /topoferte — Abonează-te la top oferte zilnice\n` +
       `🛑 /stop — Oprește o alertă\n` +
+      `🚫 /stop\\_topoferte — Dezabonare top oferte\n` +
       `❓ /help — Ajutor\n\n` +
       `📞 *Contact agenție:* ${AGENCY.phone}\n` +
       `🌐 ${AGENCY.site}`,
@@ -465,11 +492,213 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
       `2️⃣ Setezi datele, numărul de persoane, bugetul\n` +
       `3️⃣ Verific prețurile periodic (la fiecare oră)\n` +
       `4️⃣ Când găsesc o ofertă bună, primești notificare aici!\n\n` +
+      `🏆 *Top oferte zilnice:*\n` +
+      `• /topoferte — primești zilnic cele mai bune 3 oferte\n` +
+      `• Alegi destinațiile care te interesează\n` +
+      `• /stop\\_topoferte — te dezabonezi oricând\n\n` +
       `💡 *Sfaturi:*\n` +
       `• Poți avea mai multe alerte active simultan\n` +
       `• Prețurile se verifică automat, nu trebuie să faci nimic\n` +
       `• Folosește /stop pentru a opri o alertă\n\n` +
       `📞 Pentru rezervări, contactează-ne: ${AGENCY.phone}`,
+      { parse_mode: 'Markdown' }
+    );
+  });
+
+  // ===== /topoferte COMMAND — Subscribe to daily top deals =====
+  bot.onText(/\/topoferte/, (msg) => {
+    trackUser(msg);
+    const chatId = msg.chat.id;
+
+    // Check if already subscribed
+    const existing = stmts.getSubscription.get(chatId, 'daily_deals');
+    if (existing) {
+      const currentDests = existing.destinations ? existing.destinations.split(',') : ['all'];
+      const destNames = currentDests.map(d => {
+        if (d === 'all') return '🌍 Toate destinațiile';
+        const c = COUNTRIES[d];
+        return c ? `${c.flag} ${d.charAt(0).toUpperCase() + d.slice(1)}` : d;
+      }).join(', ');
+
+      bot.sendMessage(chatId,
+        `✅ Ești deja abonat la *Top Oferte Zilnice*!\n\n` +
+        `📍 Destinații: ${destNames}\n\n` +
+        `Vrei să schimbi destinațiile? Alege mai jos sau /stop\\_topoferte pentru dezabonare.`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '🌍 Toate destinațiile', callback_data: 'topoferte_all' }],
+              ...buildTopOferteDestButtons(),
+              [{ text: '🚫 Dezabonare', callback_data: 'topoferte_unsub' }]
+            ]
+          }
+        }
+      );
+      return;
+    }
+
+    bot.sendMessage(chatId,
+      `🏆 *Top Oferte Zilnice*\n\n` +
+      `Primești în fiecare dimineață *cele mai bune 3 oferte* la prețuri de nerefuzat!\n\n` +
+      `📍 Alege destinațiile care te interesează:`,
+      {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '🌍 Toate destinațiile', callback_data: 'topoferte_all' }],
+            ...buildTopOferteDestButtons(),
+          ]
+        }
+      }
+    );
+  });
+
+  // Helper: build 2-column inline keyboard buttons for top destinations
+  function buildTopOferteDestButtons() {
+    const topDests = ['turcia', 'egipt', 'grecia', 'bulgaria', 'cipru', 'emirate', 'spania', 'italia'];
+    const rows = [];
+    for (let i = 0; i < topDests.length; i += 2) {
+      const row = [];
+      row.push({
+        text: `${COUNTRIES[topDests[i]].flag} ${topDests[i].charAt(0).toUpperCase() + topDests[i].slice(1)}`,
+        callback_data: `topoferte_dest_${topDests[i]}`
+      });
+      if (topDests[i + 1]) {
+        row.push({
+          text: `${COUNTRIES[topDests[i + 1]].flag} ${topDests[i + 1].charAt(0).toUpperCase() + topDests[i + 1].slice(1)}`,
+          callback_data: `topoferte_dest_${topDests[i + 1]}`
+        });
+      }
+      rows.push(row);
+    }
+    return rows;
+  }
+
+  // Track selected destinations for multi-select
+  const topOferteSelections = new Map();
+
+  // Handle topoferte callbacks
+  bot.on('callback_query', (query) => {
+    if (!query.data.startsWith('topoferte_')) return;
+    const chatId = query.message.chat.id;
+    bot.answerCallbackQuery(query.id);
+
+    if (query.data === 'topoferte_unsub') {
+      stmts.deactivateSubscription.run(chatId, 'daily_deals');
+      topOferteSelections.delete(chatId);
+      bot.sendMessage(chatId,
+        `🚫 Te-ai dezabonat de la *Top Oferte Zilnice*.\n\nPoți reveni oricând cu /topoferte`,
+        { parse_mode: 'Markdown' }
+      );
+      return;
+    }
+
+    if (query.data === 'topoferte_all') {
+      stmts.upsertSubscription.run(chatId, 'daily_deals', 'all');
+      topOferteSelections.delete(chatId);
+      bot.sendMessage(chatId,
+        `✅ *Te-ai abonat la Top Oferte Zilnice!*\n\n` +
+        `🌍 Vei primi zilnic cele mai bune oferte din *toate destinațiile*.\n\n` +
+        `⏰ Ofertele vin dimineața la ora 9:00.\n` +
+        `🚫 Dezabonare: /stop\\_topoferte`,
+        { parse_mode: 'Markdown' }
+      );
+      return;
+    }
+
+    if (query.data === 'topoferte_done') {
+      const selected = topOferteSelections.get(chatId);
+      if (!selected || selected.size === 0) {
+        bot.sendMessage(chatId, `⚠️ Nu ai selectat nicio destinație. Alege cel puțin una sau apasă "Toate destinațiile".`);
+        return;
+      }
+      const destStr = Array.from(selected).join(',');
+      stmts.upsertSubscription.run(chatId, 'daily_deals', destStr);
+      topOferteSelections.delete(chatId);
+
+      const destNames = Array.from(selected).map(d => {
+        const c = COUNTRIES[d];
+        return c ? `${c.flag} ${d.charAt(0).toUpperCase() + d.slice(1)}` : d;
+      }).join(', ');
+
+      bot.sendMessage(chatId,
+        `✅ *Te-ai abonat la Top Oferte Zilnice!*\n\n` +
+        `📍 Destinații: ${destNames}\n\n` +
+        `⏰ Ofertele vin dimineața la ora 9:00.\n` +
+        `🚫 Dezabonare: /stop\\_topoferte`,
+        { parse_mode: 'Markdown' }
+      );
+      return;
+    }
+
+    // Toggle destination selection
+    if (query.data.startsWith('topoferte_dest_')) {
+      const dest = query.data.replace('topoferte_dest_', '');
+      if (!topOferteSelections.has(chatId)) {
+        topOferteSelections.set(chatId, new Set());
+      }
+      const selected = topOferteSelections.get(chatId);
+      if (selected.has(dest)) {
+        selected.delete(dest);
+      } else {
+        selected.add(dest);
+      }
+
+      const selectedNames = Array.from(selected).map(d => {
+        const c = COUNTRIES[d];
+        return c ? `${c.flag} ${d.charAt(0).toUpperCase() + d.slice(1)}` : d;
+      });
+
+      const statusText = selected.size > 0
+        ? `✅ Selectate: ${selectedNames.join(', ')}\n\nAlege mai multe sau apasă *Confirmă*:`
+        : `Alege destinațiile care te interesează:`;
+
+      // Update the message with current selection
+      bot.editMessageText(
+        `🏆 *Top Oferte Zilnice*\n\n${statusText}`,
+        {
+          chat_id: chatId,
+          message_id: query.message.message_id,
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '🌍 Toate destinațiile', callback_data: 'topoferte_all' }],
+              ...buildTopOferteDestButtons().map(row =>
+                row.map(btn => {
+                  const d = btn.callback_data.replace('topoferte_dest_', '');
+                  return {
+                    ...btn,
+                    text: selected.has(d) ? `✅ ${btn.text}` : btn.text
+                  };
+                })
+              ),
+              ...(selected.size > 0 ? [[{ text: '✅ Confirmă abonarea', callback_data: 'topoferte_done' }]] : [])
+            ]
+          }
+        }
+      ).catch(() => {}); // Ignore edit errors (message not modified)
+      return;
+    }
+  });
+
+  // ===== /stop_topoferte COMMAND — Unsubscribe from daily deals =====
+  bot.onText(/\/stop_topoferte/, (msg) => {
+    trackUser(msg);
+    const chatId = msg.chat.id;
+    const existing = stmts.getSubscription.get(chatId, 'daily_deals');
+
+    if (!existing) {
+      bot.sendMessage(chatId,
+        `ℹ️ Nu ești abonat la Top Oferte Zilnice.\n\nAbonează-te cu /topoferte`,
+        { parse_mode: 'Markdown' }
+      );
+      return;
+    }
+
+    stmts.deactivateSubscription.run(chatId, 'daily_deals');
+    bot.sendMessage(chatId,
+      `🚫 Te-ai dezabonat de la *Top Oferte Zilnice*.\n\nPoți reveni oricând cu /topoferte`,
       { parse_mode: 'Markdown' }
     );
   });
@@ -1259,6 +1488,137 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
     return { total: allUsers.length, sent, blocked, failed };
   }
 
+  // ===== DAILY TOP DEALS — search and send best offers to subscribers =====
+  async function sendDailyTopDeals() {
+    const subscribers = stmts.getActiveSubscriptions.all('daily_deals');
+    if (subscribers.length === 0) {
+      console.log('[TopDeals] No active subscribers, skipping');
+      return { sent: 0, total: 0 };
+    }
+
+    console.log(`[TopDeals] Sending daily top deals to ${subscribers.length} subscribers...`);
+
+    // Popular destinations to search — defaults for "all"
+    const defaultDests = ['turcia', 'egipt', 'grecia', 'bulgaria', 'cipru', 'emirate'];
+
+    // Build date range: next 7-30 days
+    const now = new Date();
+    const checkIn = new Date(now.getTime() + 7 * 86400000);
+    const checkTo = new Date(now.getTime() + 30 * 86400000);
+    const fmtDate = (d) => `${d.getDate().toString().padStart(2, '0')}.${(d.getMonth() + 1).toString().padStart(2, '0')}.${d.getFullYear()}`;
+
+    // Search top deals for each destination
+    const dealsByDest = {};
+    for (const destName of defaultDests) {
+      const country = COUNTRIES[destName];
+      if (!country) continue;
+      try {
+        const searchParams = {
+          countryId: country.id,
+          checkIn: fmtDate(checkIn),
+          checkTo: fmtDate(checkTo),
+          length: '7',
+          people: '2',
+          transport: country.transport || 'air',
+          deptCity: '1831',
+          currencyLocal: 'eur',
+        };
+        const hotelPrices = await searchPricesFn(searchParams);
+        if (!hotelPrices) continue;
+
+        const sorted = Object.entries(hotelPrices)
+          .map(([id, data]) => ({ id, ...data }))
+          .filter(h => h.price > 0)
+          .sort((a, b) => a.price - b.price)
+          .slice(0, 3);
+
+        if (sorted.length > 0) {
+          dealsByDest[destName] = sorted;
+        }
+        // Delay between API calls
+        await new Promise(r => setTimeout(r, 2000));
+      } catch (err) {
+        console.error(`[TopDeals] Error searching ${destName}:`, err.message);
+      }
+    }
+
+    if (Object.keys(dealsByDest).length === 0) {
+      console.log('[TopDeals] No deals found for any destination');
+      return { sent: 0, total: subscribers.length, noDeals: true };
+    }
+
+    let sent = 0, failed = 0, blocked = 0;
+
+    for (const sub of subscribers) {
+      try {
+        // Determine which destinations this subscriber wants
+        const wantedDests = sub.destinations === 'all'
+          ? defaultDests
+          : sub.destinations.split(',').filter(d => COUNTRIES[d]);
+
+        // Filter deals to subscriber's preferences
+        const relevantDeals = {};
+        for (const dest of wantedDests) {
+          if (dealsByDest[dest]) {
+            relevantDeals[dest] = dealsByDest[dest];
+          }
+        }
+
+        if (Object.keys(relevantDeals).length === 0) continue;
+
+        // Build the message
+        let text = `🏆 <b>Top Oferte Zilnice — ${fmtDate(now)}</b>\n\n`;
+        text += `Cele mai bune oferte pentru tine:\n\n`;
+
+        for (const [destName, offers] of Object.entries(relevantDeals)) {
+          const country = COUNTRIES[destName];
+          const flag = country ? country.flag : '🏖️';
+          text += `${flag} <b>${destName.charAt(0).toUpperCase() + destName.slice(1)}</b>\n`;
+
+          offers.forEach((offer, i) => {
+            const medal = ['🥇', '🥈', '🥉'][i];
+            const hotelName = offer.name ? escHtml(offer.name).substring(0, 40) : `Hotel #${offer.id}`;
+            text += `  ${medal} ${hotelName}\n`;
+            text += `     💰 <b>${Math.round(offer.price)} EUR</b>/pers`;
+            if (offer.stars) text += ` | ⭐${offer.stars}`;
+            text += `\n`;
+          });
+          text += `\n`;
+        }
+
+        text += `📅 Perioadă: ${fmtDate(checkIn)} — ${fmtDate(checkTo)} | 🌙 7 nopți | 👥 2 pers\n\n`;
+        text += `🔗 <a href="https://zebratur.md">Caută pe ZebraTur.md</a>\n`;
+        text += `📞 Rezervări: ${AGENCY.phone}`;
+
+        await bot.sendMessage(sub.chat_id, text, {
+          parse_mode: 'HTML',
+          disable_web_page_preview: true,
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '🌐 Caută pe ZebraTur', url: 'https://zebratur.md' }],
+              [{ text: '💬 Contactează agentul', url: 'https://t.me/Zebraturbot' }],
+              [{ text: '🚫 Dezabonare', callback_data: 'topoferte_unsub' }]
+            ]
+          }
+        });
+        sent++;
+        await new Promise(r => setTimeout(r, 50));
+      } catch (err) {
+        if (err.response?.statusCode === 403) {
+          blocked++;
+          stmts.deactivateSubscription.run(sub.chat_id, 'daily_deals');
+          console.log(`[TopDeals] User ${sub.chat_id} blocked bot — unsubscribed`);
+        } else {
+          failed++;
+          console.error(`[TopDeals] Failed for ${sub.chat_id}:`, err.message);
+        }
+      }
+    }
+
+    console.log(`[TopDeals] Done: ${sent} sent, ${blocked} blocked, ${failed} failed`);
+    return { total: subscribers.length, sent, blocked, failed };
+  }
+
   // ===== RETURN BOT INTERFACE =====
   return {
     bot,
@@ -1267,6 +1627,7 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
     sendTelegramPriceAlert,
     sendTelegramHotelAlert,
     broadcastMessage,
+    sendDailyTopDeals,
   };
 }
 
