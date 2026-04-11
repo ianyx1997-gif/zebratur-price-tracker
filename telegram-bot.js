@@ -1174,22 +1174,40 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
     text += `🔗 [Vezi toate ofertele pe ZebraTur](${link})\n`;
     text += `📞 Rezervări: ${AGENCY.phone}`;
 
+    // Try to get photo from the best offer
+    const bestOfferImg = allOffers[0]?.img || null;
+    const replyMarkup = {
+      inline_keyboard: [
+        [{ text: '🔗 Vezi oferte', url: link }],
+        [{ text: '💬 Contactează agentul', url: 'https://t.me/Zebraturbot' }]
+      ]
+    };
+
     try {
-      await bot.sendMessage(alert.chat_id, text, {
-        parse_mode: 'Markdown',
-        disable_web_page_preview: true,
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: '🔗 Vezi oferte', url: link }],
-            [{ text: '💬 Contactează agentul', url: 'https://t.me/Zebraturbot' }]
-          ]
+      let sent = false;
+      if (bestOfferImg) {
+        try {
+          await bot.sendPhoto(alert.chat_id, bestOfferImg, {
+            caption: text,
+            parse_mode: 'Markdown',
+            reply_markup: replyMarkup
+          });
+          sent = true;
+        } catch (photoErr) {
+          console.log(`[Telegram] Photo failed for destination alert, falling back to text: ${photoErr.message}`);
         }
-      });
+      }
+      if (!sent) {
+        await bot.sendMessage(alert.chat_id, text, {
+          parse_mode: 'Markdown',
+          disable_web_page_preview: true,
+          reply_markup: replyMarkup
+        });
+      }
       stmts.markAlertNotified.run(alert.id);
-      console.log(`[Telegram] Alert sent to ${alert.chat_id} for ${alert.country_name}`);
+      console.log(`[Telegram] Alert sent to ${alert.chat_id} for ${alert.country_name}${sent && bestOfferImg ? ' [with photo]' : ''}`);
     } catch (err) {
       console.error(`[Telegram] Failed to send to ${alert.chat_id}:`, err.message);
-      // If bot was blocked by user, deactivate their alerts
       if (err.response?.statusCode === 403) {
         console.log(`[Telegram] User ${alert.chat_id} blocked the bot, deactivating alerts`);
         db.prepare('UPDATE telegram_alerts SET active = 0 WHERE chat_id = ?').run(alert.chat_id);
@@ -1236,19 +1254,40 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
     if (alert.food) text += `🍽️ ${alert.food.toUpperCase()}\n`;
     text += `\n📞 Rezervări: ${AGENCY.phone}`;
 
+    // Try to get hotel photo: from DB (tour_img) or from API result (hotelData.img)
+    const photoUrl = alert.tour_img || hotelData.img || null;
+    const replyMarkup = {
+      inline_keyboard: [
+        [{ text: '🔗 Vezi oferta', url: link }],
+        [{ text: '💬 Contactează agentul', url: 'https://t.me/Zebraturbot' }]
+      ]
+    };
+
     try {
-      await bot.sendMessage(alert.chat_id, text, {
-        parse_mode: 'HTML',
-        disable_web_page_preview: true,
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: '🔗 Vezi oferta', url: link }],
-            [{ text: '💬 Contactează agentul', url: 'https://t.me/Zebraturbot' }]
-          ]
+      let sent = false;
+      // Try sending with photo first
+      if (photoUrl) {
+        try {
+          await bot.sendPhoto(alert.chat_id, photoUrl, {
+            caption: text,
+            parse_mode: 'HTML',
+            reply_markup: replyMarkup
+          });
+          sent = true;
+        } catch (photoErr) {
+          console.log(`[Telegram] Photo failed for hotel ${alert.tour_id}, falling back to text: ${photoErr.message}`);
         }
-      });
+      }
+      // Fallback: send as text message if no photo or photo failed
+      if (!sent) {
+        await bot.sendMessage(alert.chat_id, text, {
+          parse_mode: 'HTML',
+          disable_web_page_preview: true,
+          reply_markup: replyMarkup
+        });
+      }
       stmts.markAlertNotified.run(alert.id);
-      console.log(`[Telegram] Hotel alert sent to ${alert.chat_id} for hotel ${alert.tour_id} (${hotelName})`);
+      console.log(`[Telegram] Hotel alert sent to ${alert.chat_id} for hotel ${alert.tour_id} (${hotelName})${sent && photoUrl ? ' [with photo]' : ''}`);
     } catch (err) {
       console.error(`[Telegram] Failed to send hotel alert to ${alert.chat_id}:`, err.message);
       if (err.response?.statusCode === 403) {

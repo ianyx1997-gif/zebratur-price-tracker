@@ -324,7 +324,9 @@ async function searchPrices(searchParams) {
               hotelPrices[hotelId] = {
                 price: parseFloat(hotel.p),
                 currency: hotel.pu || 'eur',
-                name: hotel.n || hotel.ohn || hotelId
+                name: hotel.n || hotel.ohn || hotelId,
+                stars: hotel.s || hotel.stars || null,
+                img: hotel.f || hotel.img || hotel.ph || null
               };
             }
           }
