@@ -1587,9 +1587,9 @@ app.get('/api/search-tours', async (req, res) => {
     const defaultCheckTo = new Date(checkInDate.getTime() + 21 * 86400000).toISOString().split('T')[0];
     const checkTo = req.query.checkTo || defaultCheckTo;
 
-    // nights = hotel nights the user wants; Otpusk length = nights + 1 (transfer day)
-    const hotelNights = parseInt(req.query.nights) || 7;
-    const otpuskLength = String(hotelNights + 1); // +1 for transfer day
+    // nights = exact Otpusk length value, passed as-is (already includes transfer day)
+    // Examples: "7 nopți" → nights=7, "5+1" → nights=6, "9+1" → nights=10
+    const otpuskLength = String(parseInt(req.query.nights) || 7);
 
     const people = req.query.people || '2';
     const food = req.query.food || '';
@@ -1600,7 +1600,7 @@ app.get('/api/search-tours', async (req, res) => {
     const limit = parseInt(req.query.limit) || 10;
     const sortBy = req.query.sort || 'price'; // price, stars, rating
 
-    console.log(`[AI-Search] ${countryName} (${countryId}), ${checkIn}-${checkTo}, ${hotelNights}n (+1 transfer = ${otpuskLength}), ${people}p, food=${food}, stars=${stars}`);
+    console.log(`[AI-Search] ${countryName} (${countryId}), ${checkIn}-${checkTo}, length=${otpuskLength}, ${people}p, food=${food}, stars=${stars}`);
 
     const searchParams = {
       countryId: String(countryId),
@@ -1649,7 +1649,7 @@ app.get('/api/search-tours', async (req, res) => {
       success: true,
       count: offers.length,
       totalFound: Object.keys(hotels).length,
-      search: { country: countryName, countryId, checkIn, checkTo, hotelNights, otpuskLength: parseInt(otpuskLength), people, food, stars, transport, deptCity },
+      search: { country: countryName, countryId, checkIn, checkTo, nights: parseInt(otpuskLength), people, food, stars, transport, deptCity },
       offers
     });
 
