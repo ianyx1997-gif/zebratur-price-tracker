@@ -1559,11 +1559,14 @@ app.get('/api/chat-history/:chatId', (req, res) => {
 });
 
 // ===== AI SEARCH API — fast tour search for AI agents =====
-// GET /api/search-tours?country=turcia&checkIn=2026-04-20&nights=7&people=2&food=ai&stars=4&maxPrice=1500&limit=3
+// GET /api/search-tours?country=turcia&checkIn=2026-06-20&nights=7&people=2&food=ai&stars=5&maxPrice=1500&limit=3
+// nights = hotel nights (without transfer day); API adds +1 for Otpusk length parameter
+// people format: first digit=adults, then 2-digit pairs=child ages (e.g. 21012 = 2 adults + kids 10,12)
+// Link format: https://zebratur.md/offers#!d=DEPT&i=COUNTRY&c=DATE&v=DATE&od=DATE&l=LEN&ol=LEN&p=PEOPLE&w=false&ex=1&page=tour&hid=HOTEL&hnm=&oid=&tr=TRANSPORT
 app.get('/api/search-tours', async (req, res) => {
   try {
     const COUNTRIES_MAP = {
-      'turcia': 115, 'egipt': 43, 'grecia': 62, 'bulgaria': 20, 'cipru': 35,
+      'turcia': 115, 'egipt': 43, 'grecia': 34, 'bulgaria': 20, 'cipru': 35,
       'emirate': 184, 'spania': 156, 'italia': 77, 'muntenegru': 119,
       'tunisia': 173, 'albania': 3, 'croatia': 33, 'maldive': 112,
       'thailanda': 162, 'sri lanka': 157, 'vietnam': 193, 'tanzania': 161,
@@ -1579,12 +1582,15 @@ app.get('/api/search-tours', async (req, res) => {
     const defaultCheckIn = new Date(now.getTime() + 7 * 86400000).toISOString().split('T')[0];
     const checkIn = req.query.checkIn || defaultCheckIn;
 
-    // checkTo: checkIn + 21 days by default (wide window)
+    // checkTo: checkIn + 21 days by default (wide search window)
     const checkInDate = new Date(checkIn);
     const defaultCheckTo = new Date(checkInDate.getTime() + 21 * 86400000).toISOString().split('T')[0];
     const checkTo = req.query.checkTo || defaultCheckTo;
 
-    const nights = req.query.nights || '7';
+    // nights = hotel nights the user wants; Otpusk length = nights + 1 (transfer day)
+    const hotelNights = parseInt(req.query.nights) || 7;
+    const otpuskLength = String(hotelNights + 1); // +1 for transfer day
+
     const people = req.query.people || '2';
     const food = req.query.food || '';
     const stars = req.query.stars || '';
@@ -1594,13 +1600,13 @@ app.get('/api/search-tours', async (req, res) => {
     const limit = parseInt(req.query.limit) || 10;
     const sortBy = req.query.sort || 'price'; // price, stars, rating
 
-    console.log(`[AI-Search] ${countryName} (${countryId}), ${checkIn}-${checkTo}, ${nights}n, ${people}p, food=${food}, stars=${stars}`);
+    console.log(`[AI-Search] ${countryName} (${countryId}), ${checkIn}-${checkTo}, ${hotelNights}n (+1 transfer = ${otpuskLength}), ${people}p, food=${food}, stars=${stars}`);
 
     const searchParams = {
       countryId: String(countryId),
       checkIn,
       checkTo,
-      length: nights,
+      length: otpuskLength,
       people,
       food,
       stars,
@@ -1616,6 +1622,13 @@ app.get('/api/search-tours', async (req, res) => {
       return res.json({ success: true, count: 0, offers: [], message: 'No offers found' });
     }
 
+    // Build correct ZebraTur offer links
+    // Format: https://zebratur.md/offers#!d=DEPT&i=COUNTRY&c=DATE&v=DATE&od=DATE&l=LEN&ol=LEN&p=PEOPLE&w=false&ex=1&page=tour&hid=HOTEL&hnm=&oid=&tr=TRANSPORT
+    function buildOfferLink(hotelId, offerCheckIn) {
+      const date = offerCheckIn || checkIn;
+      return `https://zebratur.md/offers#!d=${deptCity}&i=${countryId}&c=${date}&v=${date}&od=${date}&l=${otpuskLength}&ol=${otpuskLength}&p=${people}&w=false&ex=1&page=tour&hid=${hotelId}&hnm=&oid=&tr=${transport}`;
+    }
+
     // Convert to array and sort
     let offers = Object.entries(hotels).map(([id, h]) => ({
       hotelId: id,
@@ -1623,8 +1636,8 @@ app.get('/api/search-tours', async (req, res) => {
       price: h.price,
       currency: (h.currency || 'eur').toUpperCase(),
       stars: h.stars,
-      img: h.img,
-      link: `https://zebratur.md/${countryName}?checkIn=${checkIn}&checkTo=${checkTo}&length=${nights}&people=${people}&deptCity=${deptCity}&transport=${transport}${food ? '&food=' + food : ''}${stars ? '&stars=' + stars : ''}&page=tour`
+      img: h.img ? (h.img.startsWith('http') ? h.img : `https://newimg.otpusk.com/2/400x300/${h.img}`) : null,
+      link: buildOfferLink(id)
     }));
 
     if (sortBy === 'price') offers.sort((a, b) => a.price - b.price);
@@ -1636,7 +1649,7 @@ app.get('/api/search-tours', async (req, res) => {
       success: true,
       count: offers.length,
       totalFound: Object.keys(hotels).length,
-      search: { country: countryName, countryId, checkIn, checkTo, nights, people, food, stars, deptCity },
+      search: { country: countryName, countryId, checkIn, checkTo, hotelNights, otpuskLength: parseInt(otpuskLength), people, food, stars, transport, deptCity },
       offers
     });
 
