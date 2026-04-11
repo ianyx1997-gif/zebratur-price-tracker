@@ -54,6 +54,19 @@ const FOOD_CODES = {
   'ultra all inclusive': 'uai',
 };
 
+// Food hierarchy: each level includes itself + all superior levels
+// ob < bb < hb < fb < ai < uai
+const FOOD_HIERARCHY = ['ob', 'bb', 'hb', 'fb', 'ai', 'uai'];
+function expandFood(foodCode) {
+  if (!foodCode) return '';
+  // If already comma-separated, return as-is
+  if (foodCode.includes(',')) return foodCode;
+  const idx = FOOD_HIERARCHY.indexOf(foodCode);
+  if (idx < 0) return foodCode;
+  // Return this level + all superior levels (comma-separated)
+  return FOOD_HIERARCHY.slice(idx).join(',');
+}
+
 const MONTHS_RO = {
   'ianuarie': '01', 'februarie': '02', 'martie': '03', 'aprilie': '04',
   'mai': '05', 'iunie': '06', 'iulie': '07', 'august': '08',
@@ -136,6 +149,7 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
       chat_id INTEGER NOT NULL,
       direction TEXT NOT NULL,
       message TEXT,
+      is_read INTEGER DEFAULT 0,
       sent_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -156,6 +170,7 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
   try { db.exec(`ALTER TABLE telegram_alerts ADD COLUMN tour_url TEXT`); console.log('[Telegram DB] Added tour_url column'); } catch(e) { /* exists */ }
   try { db.exec(`ALTER TABLE telegram_alerts ADD COLUMN tour_img TEXT`); console.log('[Telegram DB] Added tour_img column'); } catch(e) { /* exists */ }
   try { db.exec(`ALTER TABLE telegram_alerts ADD COLUMN search_params TEXT`); console.log('[Telegram DB] Added search_params column'); } catch(e) { /* exists */ }
+  try { db.exec(`ALTER TABLE telegram_messages ADD COLUMN is_read INTEGER DEFAULT 0`); console.log('[Telegram DB] Added is_read column to messages'); } catch(e) { /* exists */ }
 
   // Prepared statements
   const stmts = {
@@ -204,8 +219,10 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
     getPriceHistory: db.prepare(`SELECT * FROM telegram_price_history WHERE alert_id = ? ORDER BY recorded_at ASC`),
     getPriceHistoryAll: db.prepare(`SELECT * FROM telegram_price_history ORDER BY recorded_at ASC`),
     // Messages
-    insertMessage: db.prepare(`INSERT INTO telegram_messages (chat_id, direction, message) VALUES (?, ?, ?)`),
+    insertMessage: db.prepare(`INSERT INTO telegram_messages (chat_id, direction, message, is_read) VALUES (?, ?, ?, ?)`),
     getMessagesByChat: db.prepare(`SELECT * FROM telegram_messages WHERE chat_id = ? ORDER BY sent_at DESC LIMIT 50`),
+    markChatRead: db.prepare(`UPDATE telegram_messages SET is_read = 1 WHERE chat_id = ? AND direction = 'in' AND is_read = 0`),
+    getUnreadCounts: db.prepare(`SELECT chat_id, COUNT(*) as unread FROM telegram_messages WHERE direction = 'in' AND is_read = 0 GROUP BY chat_id`),
   };
 
   // ===== HELPER: Track user =====
@@ -218,7 +235,7 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
   bot.on('message', (msg) => {
     if (!msg.text) return;
     try {
-      stmts.insertMessage.run(msg.chat.id, 'in', msg.text.substring(0, 2000));
+      stmts.insertMessage.run(msg.chat.id, 'in', msg.text.substring(0, 2000), 0);
     } catch(e) { /* ignore logging errors */ }
   });
 
@@ -274,7 +291,7 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
     link += `&tc=${childAges}`;
     link += `&g=1`;
     link += `&d=${alert.dept_city_id || 1831}`;
-    link += `&o=${alert.food || ''}`;
+    link += `&o=${expandFood(alert.food)}`;
     link += `&st=${alert.stars || ''}`;
     link += `&pf=100&pt=${alert.max_price || 20000}`;
     link += `&rt=0,10&th=&e=`;
@@ -1034,6 +1051,9 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
           { text: '🍳 Mic dejun', callback_data: 'food_bb' },
           { text: '🍽️ Demipensiune', callback_data: 'food_hb' },
         ],
+        [
+          { text: '🍴 Pensiune completă', callback_data: 'food_fb' },
+        ],
         [{ text: '🔄 Orice tip de masă', callback_data: 'food_any' }]
       ];
 
@@ -1291,7 +1311,10 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
       for (const group of Object.values(searchGroups)) {
         try {
           // Use stored search params directly — same API call as email
-          const hotelPrices = await searchPricesFn(group.params);
+          // Expand food to include superior meal types
+          const searchP = { ...group.params };
+          if (searchP.food) searchP.food = expandFood(searchP.food);
+          const hotelPrices = await searchPricesFn(searchP);
           if (!hotelPrices) continue;
 
           const sortedHotels = Object.entries(hotelPrices)
@@ -1338,7 +1361,7 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
             checkTo: group.params.checkTo || group.params.checkIn,
             length: group.params.length,
             people: group.params.people,
-            food: group.params.food,
+            food: expandFood(group.params.food),
             stars: group.params.stars,
             transport: group.params.transport,
             deptCity: group.params.deptCity,

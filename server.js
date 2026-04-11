@@ -795,6 +795,11 @@ app.get('/admin/dashboard', (req, res) => {
   try { subscriptions = db.prepare('SELECT * FROM telegram_subscriptions WHERE active = 1').all(); } catch(e) { /* table might not exist yet */ }
   let priceHistory = [];
   try { priceHistory = db.prepare('SELECT * FROM telegram_price_history ORDER BY recorded_at ASC').all(); } catch(e) { /* table might not exist yet */ }
+  let unreadCounts = {};
+  try {
+    const rows = db.prepare("SELECT chat_id, COUNT(*) as unread FROM telegram_messages WHERE direction = 'in' AND is_read = 0 GROUP BY chat_id").all();
+    rows.forEach(r => { unreadCounts[r.chat_id] = r.unread; });
+  } catch(e) { /* table might not exist yet */ }
 
   const totalUsers = users.length;
   const totalAlerts = alerts.length;
@@ -817,7 +822,7 @@ app.get('/admin/dashboard', (req, res) => {
     link += '&l=' + (a.nights || 7);
     link += '&p=' + (a.adults || 2);
     link += '&d=' + (a.dept_city_id || 1831);
-    link += '&o=' + (a.food || '') + '&st=' + (a.stars || '');
+    link += '&o=' + expandFoodServer(a.food) + '&st=' + (a.stars || '');
     link += '&r=' + (a.transport || 'air') + '&cu=' + (a.currency || 'eur');
     link += '&page=tour';
     return link;
@@ -929,7 +934,10 @@ app.get('/admin/dashboard', (req, res) => {
         '<div class="user-badges">' +
           (userAlerts.length > 0 ? '<span class="badge badge-alert">' + userAlerts.length + ' alerte</span>' : '') +
           (userSubs.length > 0 ? '<span class="badge badge-sub">' + userSubs.length + ' abon.</span>' : '') +
-          '<button class="msg-btn" onclick="openMsg(' + u.chat_id + ',\'' + escH(name).replace(/'/g, "\\'") + '\')">✉️</button>' +
+          '<button class="msg-btn" id="msgbtn_' + u.chat_id + '" onclick="openMsg(' + u.chat_id + ',\'' + escH(name).replace(/'/g, "\\'") + '\')">' +
+            '✉️' +
+            (unreadCounts[u.chat_id] ? '<span class="unread-badge">' + unreadCounts[u.chat_id] + '</span>' : '') +
+          '</button>' +
         '</div>' +
       '</div>' +
       (alertsHtml ? '<div class="alerts-section"><div class="section-title">🔔 Alerte active</div>' + alertsHtml + '</div>' : '') +
@@ -990,8 +998,9 @@ app.get('/admin/dashboard', (req, res) => {
   .sub-type{font-weight:500;color:#1e293b}
   .sub-dest{color:#64748b}
   .empty-state{padding:12px 20px;color:#94a3b8;font-size:13px;font-style:italic}
-  .msg-btn{padding:4px 10px;border:1px solid #e2e8f0;border-radius:8px;background:#f8fafc;font-size:12px;cursor:pointer;transition:all 0.15s;color:#475569}
+  .msg-btn{padding:4px 10px;border:1px solid #e2e8f0;border-radius:8px;background:#f8fafc;font-size:12px;cursor:pointer;transition:all 0.15s;color:#475569;position:relative}
   .msg-btn:hover{border-color:#0088cc;color:#0088cc;background:#f0f9ff}
+  .unread-badge{position:absolute;top:-7px;right:-7px;background:#ef4444;color:#fff;font-size:10px;font-weight:700;min-width:18px;height:18px;border-radius:9px;display:flex;align-items:center;justify-content:center;padding:0 5px;box-shadow:0 1px 3px rgba(239,68,68,0.4);line-height:1;border:2px solid #fff}
   .modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:1000;align-items:center;justify-content:center}
   .modal-overlay.show{display:flex}
   .modal{background:#fff;border-radius:16px;box-shadow:0 8px 40px rgba(0,0,0,0.15);max-width:520px;width:92%;overflow:hidden;display:flex;flex-direction:column;max-height:85vh}
@@ -1080,6 +1089,9 @@ function openMsg(chatId, name) {
   document.getElementById('msgResult').className = 'msg-result';
   document.getElementById('msgModal').classList.add('show');
   loadChatHistory(chatId);
+  // Clear unread badge — loading chat-history marks messages as read server-side
+  var badge = document.querySelector('#msgbtn_' + chatId + ' .unread-badge');
+  if (badge) badge.remove();
 }
 
 function closeMsg() {
@@ -1180,6 +1192,16 @@ document.getElementById('msgText').addEventListener('keydown', function(e) {
 </body>
 </html>`);
 });
+
+// Helper: expand food code to include superior meal types (ob < bb < hb < fb < ai < uai)
+const FOOD_HIERARCHY_SERVER = ['ob', 'bb', 'hb', 'fb', 'ai', 'uai'];
+function expandFoodServer(foodCode) {
+  if (!foodCode) return '';
+  if (foodCode.includes(',')) return foodCode;
+  const idx = FOOD_HIERARCHY_SERVER.indexOf(foodCode);
+  if (idx < 0) return foodCode;
+  return FOOD_HIERARCHY_SERVER.slice(idx).join(',');
+}
 
 // Helper: HTML-escape for server-side templates
 function escH(str) {
@@ -1503,8 +1525,8 @@ app.post('/api/send-direct', async (req, res) => {
       parse_mode: 'HTML',
       disable_web_page_preview: false
     });
-    // Log the outgoing message
-    try { db.prepare('INSERT INTO telegram_messages (chat_id, direction, message) VALUES (?, ?, ?)').run(chat_id, 'out', message.trim().substring(0, 2000)); } catch(e) { /* ignore */ }
+    // Log the outgoing message (is_read=1 — our own messages are always "read")
+    try { db.prepare('INSERT INTO telegram_messages (chat_id, direction, message, is_read) VALUES (?, ?, ?, 1)').run(chat_id, 'out', message.trim().substring(0, 2000)); } catch(e) { /* ignore */ }
     res.json({ success: true, chat_id });
   } catch (err) {
     console.error('[DirectMsg] Error:', err.message);
@@ -1516,7 +1538,7 @@ app.post('/api/send-direct', async (req, res) => {
   }
 });
 
-// Admin: get chat history with a user
+// Admin: get chat history with a user (also marks incoming messages as read)
 app.get('/api/chat-history/:chatId', (req, res) => {
   const secret = req.query.secret;
   const BROADCAST_SECRET = process.env.BROADCAST_SECRET || 'zebra2024';
@@ -1524,7 +1546,10 @@ app.get('/api/chat-history/:chatId', (req, res) => {
     return res.status(403).json({ error: 'Invalid secret' });
   }
   try {
-    const messages = db.prepare('SELECT * FROM telegram_messages WHERE chat_id = ? ORDER BY sent_at DESC LIMIT 50').all(parseInt(req.params.chatId));
+    const chatId = parseInt(req.params.chatId);
+    const messages = db.prepare('SELECT * FROM telegram_messages WHERE chat_id = ? ORDER BY sent_at DESC LIMIT 50').all(chatId);
+    // Mark all incoming messages as read when admin opens the chat
+    try { db.prepare('UPDATE telegram_messages SET is_read = 1 WHERE chat_id = ? AND direction = \'in\' AND is_read = 0').run(chatId); } catch(e) {}
     res.json({ messages: messages.reverse() }); // oldest first
   } catch(e) {
     res.json({ messages: [] });
