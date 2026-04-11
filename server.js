@@ -326,6 +326,8 @@ async function searchPrices(searchParams) {
                 currency: hotel.pu || 'eur',
                 name: hotel.n || hotel.ohn || hotelId,
                 stars: hotel.s || hotel.stars || null,
+                rating: hotel.r || hotel.rating || null,
+                reviews: hotel.rv || hotel.reviews || null,
                 img: hotel.f || hotel.img || hotel.ph || null
               };
             }
@@ -1636,12 +1638,15 @@ app.get('/api/search-tours', async (req, res) => {
       price: h.price,
       currency: (h.currency || 'eur').toUpperCase(),
       stars: h.stars,
+      rating: h.rating ? parseFloat(h.rating) : null,
+      reviews: h.reviews ? parseInt(h.reviews) : null,
       img: h.img ? (h.img.startsWith('http') ? h.img : `https://newimg.otpusk.com/2/400x300/${h.img}`) : null,
       link: buildOfferLink(id)
     }));
 
     if (sortBy === 'price') offers.sort((a, b) => a.price - b.price);
     else if (sortBy === 'stars') offers.sort((a, b) => (b.stars || 0) - (a.stars || 0));
+    else if (sortBy === 'rating') offers.sort((a, b) => (b.rating || 0) - (a.rating || 0));
 
     offers = offers.slice(0, limit);
 
