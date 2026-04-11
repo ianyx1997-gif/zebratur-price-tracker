@@ -1558,6 +1558,95 @@ app.get('/api/chat-history/:chatId', (req, res) => {
   }
 });
 
+// ===== AI SEARCH API — fast tour search for AI agents =====
+// GET /api/search-tours?country=turcia&checkIn=2026-04-20&nights=7&people=2&food=ai&stars=4&maxPrice=1500&limit=3
+app.get('/api/search-tours', async (req, res) => {
+  try {
+    const COUNTRIES_MAP = {
+      'turcia': 115, 'egipt': 43, 'grecia': 62, 'bulgaria': 20, 'cipru': 35,
+      'emirate': 184, 'spania': 156, 'italia': 77, 'muntenegru': 119,
+      'tunisia': 173, 'albania': 3, 'croatia': 33, 'maldive': 112,
+      'thailanda': 162, 'sri lanka': 157, 'vietnam': 193, 'tanzania': 161,
+      'georgia': 55, 'india': 71, 'mexic': 113, 'cuba': 34, 'dominicana': 40,
+      'morocco': 110, 'iordania': 76, 'oman': 128, 'seychelles': 148
+    };
+
+    const countryName = (req.query.country || 'turcia').toLowerCase();
+    const countryId = COUNTRIES_MAP[countryName] || parseInt(req.query.countryId) || 115;
+
+    // Default: 7 days from now
+    const now = new Date();
+    const defaultCheckIn = new Date(now.getTime() + 7 * 86400000).toISOString().split('T')[0];
+    const checkIn = req.query.checkIn || defaultCheckIn;
+
+    // checkTo: checkIn + 21 days by default (wide window)
+    const checkInDate = new Date(checkIn);
+    const defaultCheckTo = new Date(checkInDate.getTime() + 21 * 86400000).toISOString().split('T')[0];
+    const checkTo = req.query.checkTo || defaultCheckTo;
+
+    const nights = req.query.nights || '7';
+    const people = req.query.people || '2';
+    const food = req.query.food || '';
+    const stars = req.query.stars || '';
+    const transport = req.query.transport || 'air';
+    const deptCity = req.query.deptCity || '1831';
+    const maxPrice = req.query.maxPrice || '';
+    const limit = parseInt(req.query.limit) || 10;
+    const sortBy = req.query.sort || 'price'; // price, stars, rating
+
+    console.log(`[AI-Search] ${countryName} (${countryId}), ${checkIn}-${checkTo}, ${nights}n, ${people}p, food=${food}, stars=${stars}`);
+
+    const searchParams = {
+      countryId: String(countryId),
+      checkIn,
+      checkTo,
+      length: nights,
+      people,
+      food,
+      stars,
+      transport,
+      deptCity,
+      currencyLocal: 'eur',
+      priceTo: maxPrice
+    };
+
+    const hotels = await searchPrices(searchParams);
+
+    if (!hotels || Object.keys(hotels).length === 0) {
+      return res.json({ success: true, count: 0, offers: [], message: 'No offers found' });
+    }
+
+    // Convert to array and sort
+    let offers = Object.entries(hotels).map(([id, h]) => ({
+      hotelId: id,
+      name: h.name,
+      price: h.price,
+      currency: (h.currency || 'eur').toUpperCase(),
+      stars: h.stars,
+      img: h.img,
+      link: `https://zebratur.md/${countryName}?checkIn=${checkIn}&checkTo=${checkTo}&length=${nights}&people=${people}&deptCity=${deptCity}&transport=${transport}${food ? '&food=' + food : ''}${stars ? '&stars=' + stars : ''}&page=tour`
+    }));
+
+    if (sortBy === 'price') offers.sort((a, b) => a.price - b.price);
+    else if (sortBy === 'stars') offers.sort((a, b) => (b.stars || 0) - (a.stars || 0));
+
+    offers = offers.slice(0, limit);
+
+    res.json({
+      success: true,
+      count: offers.length,
+      totalFound: Object.keys(hotels).length,
+      search: { country: countryName, countryId, checkIn, checkTo, nights, people, food, stars, deptCity },
+      offers
+    });
+
+    console.log(`[AI-Search] Returned ${offers.length} of ${Object.keys(hotels).length} total hotels`);
+  } catch (err) {
+    console.error('[AI-Search] Error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Admin: manually trigger daily top deals
 app.post('/api/send-top-deals', async (req, res) => {
   try {
