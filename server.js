@@ -328,7 +328,11 @@ async function searchPrices(searchParams) {
                 stars: hotel.s || hotel.stars || null,
                 rating: hotel.r || hotel.rating || null,
                 reviews: hotel.rv || hotel.reviews || null,
-                img: hotel.f || hotel.img || hotel.ph || null
+                img: hotel.f || hotel.img || hotel.ph || null,
+                length: hotel.l || hotel.length || null,
+                checkIn: hotel.d || hotel.dt || hotel.checkIn || null,
+                nights: hotel.nh || hotel.nl || hotel.nights || null,
+                _rawKeys: Object.keys(hotel)
               };
             }
           }
@@ -1601,6 +1605,7 @@ app.get('/api/search-tours', async (req, res) => {
     const maxPrice = req.query.maxPrice || '';
     const limit = parseInt(req.query.limit) || 10;
     const sortBy = req.query.sort || 'price'; // price, stars, rating
+    const debug = req.query.debug === '1';
 
     console.log(`[AI-Search] ${countryName} (${countryId}), ${checkIn}-${checkTo}, length=${otpuskLength}, ${people}p, food=${food}, stars=${stars}`);
 
@@ -1626,23 +1631,30 @@ app.get('/api/search-tours', async (req, res) => {
 
     // Build correct ZebraTur offer links
     // Format: https://zebratur.md/offers#!d=DEPT&i=COUNTRY&c=DATE&v=DATE&od=DATE&l=LEN&ol=LEN&p=PEOPLE&w=false&ex=1&page=tour&hid=HOTEL&hnm=&oid=&tr=TRANSPORT
-    function buildOfferLink(hotelId, offerCheckIn) {
+    function buildOfferLink(hotelId, offerCheckIn, offerLength) {
       const date = offerCheckIn || checkIn;
-      return `https://zebratur.md/offers#!d=${deptCity}&i=${countryId}&c=${date}&v=${date}&od=${date}&l=${otpuskLength}&ol=${otpuskLength}&p=${people}&w=false&ex=1&page=tour&hid=${hotelId}&hnm=&oid=&tr=${transport}`;
+      const len = offerLength || otpuskLength;
+      return `https://zebratur.md/offers#!d=${deptCity}&i=${countryId}&c=${date}&v=${date}&od=${date}&l=${len}&ol=${len}&p=${people}&w=false&ex=1&page=tour&hid=${hotelId}&hnm=&oid=&tr=${transport}`;
     }
 
     // Convert to array and sort
-    let offers = Object.entries(hotels).map(([id, h]) => ({
-      hotelId: id,
-      name: h.name,
-      price: h.price,
-      currency: (h.currency || 'eur').toUpperCase(),
-      stars: h.stars,
-      rating: h.rating ? parseFloat(h.rating) : null,
-      reviews: h.reviews ? parseInt(h.reviews) : null,
-      img: h.img ? (h.img.startsWith('http') ? h.img : `https://newimg.otpusk.com/2/400x300/${h.img}`) : null,
-      link: buildOfferLink(id)
-    }));
+    let offers = Object.entries(hotels).map(([id, h]) => {
+      const offer = {
+        hotelId: id,
+        name: h.name,
+        price: h.price,
+        currency: (h.currency || 'eur').toUpperCase(),
+        stars: h.stars,
+        rating: h.rating ? parseFloat(h.rating) : null,
+        reviews: h.reviews ? parseInt(h.reviews) : null,
+        img: h.img ? (h.img.startsWith('http') ? h.img : `https://newimg.otpusk.com/2/400x300/${h.img}`) : null,
+        link: buildOfferLink(id, h.checkIn, h.length)
+      };
+      if (debug) {
+        offer._raw = { length: h.length, checkIn: h.checkIn, nights: h.nights, _rawKeys: h._rawKeys };
+      }
+      return offer;
+    });
 
     if (sortBy === 'price') offers.sort((a, b) => a.price - b.price);
     else if (sortBy === 'stars') offers.sort((a, b) => (b.stars || 0) - (a.stars || 0));
