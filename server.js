@@ -332,7 +332,8 @@ async function searchPrices(searchParams) {
                 length: hotel.l || hotel.length || null,
                 checkIn: hotel.d || hotel.dt || hotel.checkIn || null,
                 nights: hotel.nh || hotel.nl || hotel.nights || null,
-                _rawKeys: Object.keys(hotel)
+                _rawKeys: Object.keys(hotel),
+                _firstOffer: hotel.offers ? (Array.isArray(hotel.offers) ? hotel.offers[0] : Object.values(hotel.offers)[0]) : null
               };
             }
           }
@@ -613,6 +614,20 @@ cron.schedule(topDealsCron, async () => {
   }
 });
 console.log(`[Cron] Daily top deals scheduled: ${topDealsCron} (daily at 9:00 Moldova time)`);
+
+// Daily personalized search offers cron — runs at 9:30 Moldova time (06:30 UTC)
+const searchOffersCron = process.env.SEARCH_OFFERS_CRON || '30 6 * * *';
+cron.schedule(searchOffersCron, async () => {
+  if (!telegramBot || !telegramBot.sendDailySearchOffers) return;
+  try {
+    console.log('[Cron] Starting daily search offers...');
+    const result = await telegramBot.sendDailySearchOffers();
+    console.log(`[Cron] Daily search offers done: ${result.sent}/${result.total} sent`);
+  } catch (err) {
+    console.error('[Cron] Daily search offers error:', err.message);
+  }
+});
+console.log(`[Cron] Daily search offers scheduled: ${searchOffersCron} (daily at 9:30 Moldova time)`);
 
 // ===== API ROUTES =====
 
@@ -1651,7 +1666,7 @@ app.get('/api/search-tours', async (req, res) => {
         link: buildOfferLink(id, h.checkIn, h.length)
       };
       if (debug) {
-        offer._raw = { length: h.length, checkIn: h.checkIn, nights: h.nights, _rawKeys: h._rawKeys };
+        offer._raw = { length: h.length, checkIn: h.checkIn, nights: h.nights, _rawKeys: h._rawKeys, _firstOffer: h._firstOffer };
       }
       return offer;
     });
@@ -1692,6 +1707,25 @@ app.post('/api/send-top-deals', async (req, res) => {
     res.json({ success: true, ...result });
   } catch (err) {
     console.error('[TopDeals API] Error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin: manually trigger daily search offers
+app.post('/api/send-search-offers', async (req, res) => {
+  try {
+    const { secret } = req.body;
+    const BROADCAST_SECRET = process.env.BROADCAST_SECRET || 'zebra2024';
+    if (secret !== BROADCAST_SECRET) {
+      return res.status(403).json({ error: 'Invalid secret' });
+    }
+    if (!telegramBot || !telegramBot.sendDailySearchOffers) {
+      return res.status(500).json({ error: 'Telegram bot not available or sendDailySearchOffers not found' });
+    }
+    const result = await telegramBot.sendDailySearchOffers();
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error('[SearchOffers API] Error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });

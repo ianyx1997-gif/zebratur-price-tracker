@@ -544,6 +544,105 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
     }
   }
 
+  // ===== HELPER: Handle search subscription from HTML form deep link =====
+  // Payload format: sub_COUNTRY_DEPT_CHECKIN_NIGHTS_PEOPLE_STARS_FOOD_PRICEMAX
+  // Example: sub_115_1831_20260503_7_2_5_ai-uai_2500
+  function handleSearchSubscription(msg, name, payload) {
+    const parts = payload.replace(/^sub_/, '').split('_');
+    if (parts.length < 8) {
+      bot.sendMessage(msg.chat.id, '❌ Parametrii de căutare sunt incorecți. Încearcă din nou de pe formular.');
+      return;
+    }
+
+    const countryId = parseInt(parts[0]) || 0;
+    const deptCityId = parseInt(parts[1]) || 1831;
+    const checkInRaw = parts[2]; // 20260503
+    const nights = parseInt(parts[3]) || 7;
+    const people = parts[4] || '2';
+    const starsRaw = parts[5] !== '0' ? parts[5].replace(/-/g, ',') : null; // 4-5 → 4,5
+    const foodRaw = parts[6] !== 'any' ? parts[6].replace(/-/g, ',') : null; // ai-uai → ai,uai
+    const maxPrice = parts[7] && parts[7] !== '0' ? parseInt(parts[7]) : null;
+
+    // Parse check-in date: 20260503 → 2026-05-03
+    let checkIn = null;
+    if (checkInRaw && checkInRaw.length === 8) {
+      checkIn = checkInRaw.substring(0, 4) + '-' + checkInRaw.substring(4, 6) + '-' + checkInRaw.substring(6, 8);
+    }
+
+    // Find country/city names
+    const country = Object.entries(COUNTRIES).find(([, v]) => v.id === countryId);
+    const countryName = country ? country[0].charAt(0).toUpperCase() + country[0].slice(1) : 'Destinație';
+    const flag = country ? country[1].flag : '🏖️';
+    const transport = country ? country[1].transport : 'air';
+    const dept = Object.entries(DEPARTURE_CITIES).find(([, v]) => v.id === deptCityId);
+    const deptName = dept ? dept[1].label : 'Chișinău';
+
+    // Parse adults/children from combined people string
+    const adults = parseInt(people.toString()[0]) || 2;
+    let childrenAges = null;
+    if (people.length > 1) {
+      const agesStr = people.toString().slice(1);
+      const ages = [];
+      for (let i = 0; i < agesStr.length; i += 2) {
+        ages.push(parseInt(agesStr.substring(i, i + 2)));
+      }
+      if (ages.length > 0) childrenAges = ages.join(',');
+    }
+
+    // Build search params JSON for the subscription
+    const searchParams = {
+      countryId, deptCity: deptCityId, checkIn: checkIn,
+      checkTo: checkIn ? addDays(checkIn, 14) : null,
+      length: String(nights), people, stars: starsRaw,
+      food: foodRaw, transport, currencyLocal: 'eur',
+      maxPrice: maxPrice || null
+    };
+
+    // Store in subscriptions table with type 'daily_search'
+    // destinations = country name (for display), search params in JSON
+    const subData = JSON.stringify(searchParams);
+    try {
+      // Use upsert — one subscription per chat for daily_search; or allow multiple?
+      // Allow multiple: different params per search. Use insertSubscription.
+      const insertSub = db.prepare(`
+        INSERT INTO telegram_subscriptions (chat_id, subscription_type, destinations, active)
+        VALUES (?, 'daily_search', ?, 1)
+      `);
+      insertSub.run(msg.chat.id, subData);
+
+      // Build ZebraTur link for confirmation
+      const link = buildZebraturLink({
+        country_id: countryId, dept_city_id: deptCityId,
+        check_in: checkIn, check_to: checkIn ? addDays(checkIn, 14) : null,
+        nights, adults, children_ages: childrenAges,
+        stars: starsRaw ? parseInt(starsRaw) : null,
+        food: foodRaw, max_price: maxPrice, currency: 'eur', transport
+      });
+
+      let summary = `✅ *Te-ai abonat la oferte zilnice!*\n\n`;
+      summary += `${flag} *${esc(countryName)}*\n`;
+      summary += `✈️ Din ${esc(deptName)}\n`;
+      summary += `📅 De la ${checkIn || '—'} | 🌙 ${nights} nopți\n`;
+      summary += `👥 ${adults} adulți${childrenAges ? ' + copii ' + childrenAges + ' ani' : ''}\n`;
+      if (starsRaw) summary += `⭐ ${starsRaw.replace(/,/g, '/')} stele\n`;
+      if (foodRaw) summary += `🍽️ ${esc(foodRaw).toUpperCase()}\n`;
+      if (maxPrice) summary += `💰 Buget max: ${maxPrice} EUR/pers\n`;
+      summary += `\n📬 *Zilnic vei primi 3 oferte* care corespund căutării tale!\n`;
+      summary += `\n🔗 [Caută acum pe ZebraTur](${link})\n`;
+      summary += `\nFolosește /stop\\_cautare pentru a te dezabona.`;
+
+      bot.sendMessage(msg.chat.id, summary, {
+        parse_mode: 'Markdown',
+        disable_web_page_preview: true
+      });
+
+      console.log(`[Telegram] Search subscription created: ${countryName} for chat ${msg.chat.id}`);
+    } catch (err) {
+      console.error('[Telegram] Search subscription error:', err.message);
+      bot.sendMessage(msg.chat.id, '❌ Eroare la salvarea abonării. Încearcă din nou.');
+    }
+  }
+
   // ===== /start COMMAND (with optional deep link payload) =====
   bot.onText(/\/start(?:\s+(.+))?/, (msg, match) => {
     trackUser(msg);
@@ -551,6 +650,12 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
     const payload = match[1];
 
     if (payload) {
+      // SEARCH SUBSCRIPTION: starts with "sub_"
+      if (payload.startsWith('sub_')) {
+        handleSearchSubscription(msg, name, payload);
+        return;
+      }
+
       // NEW FORMAT: token-based (starts with "tg" prefix)
       if (payload.startsWith('tg') && !payload.includes('_')) {
         handleTokenPayload(msg, name, payload);
@@ -573,6 +678,7 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
       `🏆 /topoferte — Abonează-te la top oferte zilnice\n` +
       `🛑 /stop — Oprește o alertă\n` +
       `🚫 /stop\\_topoferte — Dezabonare top oferte\n` +
+      `🚫 /stop\\_cautare — Dezabonare căutări zilnice\n` +
       `❓ /help — Ajutor\n\n` +
       `📞 *Contact agenție:* ${AGENCY.phone}\n` +
       `🌐 ${AGENCY.site}`,
@@ -798,6 +904,67 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
       `🚫 Te-ai dezabonat de la *Top Oferte Zilnice*.\n\nPoți reveni oricând cu /topoferte`,
       { parse_mode: 'Markdown' }
     );
+  });
+
+  // ===== /stop_cautare COMMAND — Unsubscribe from daily search offers =====
+  bot.onText(/\/stop_cautare/, (msg) => {
+    trackUser(msg);
+    const chatId = msg.chat.id;
+
+    const subs = db.prepare(`SELECT * FROM telegram_subscriptions WHERE chat_id = ? AND subscription_type = 'daily_search' AND active = 1`).all(chatId);
+
+    if (subs.length === 0) {
+      bot.sendMessage(chatId,
+        `ℹ️ Nu ai abonări active la căutări zilnice.`,
+        { parse_mode: 'Markdown' }
+      );
+      return;
+    }
+
+    if (subs.length === 1) {
+      // Only one — deactivate it directly
+      db.prepare(`UPDATE telegram_subscriptions SET active = 0 WHERE id = ?`).run(subs[0].id);
+      bot.sendMessage(chatId,
+        `🚫 Te-ai dezabonat de la căutarea zilnică.\n\nPoți crea o nouă căutare oricând de pe formularul de pe site.`,
+        { parse_mode: 'Markdown' }
+      );
+      return;
+    }
+
+    // Multiple — show list to pick
+    const buttons = subs.map((s, idx) => {
+      let label = `#${idx + 1}`;
+      try {
+        const p = JSON.parse(s.destinations);
+        const c = Object.entries(COUNTRIES).find(([, v]) => v.id === p.countryId);
+        if (c) label = `${c[1].flag} ${c[0].charAt(0).toUpperCase() + c[0].slice(1)}`;
+        if (p.checkIn) label += ` ${p.checkIn}`;
+      } catch(e) {}
+      return [{ text: `🚫 ${label}`, callback_data: `stopsearch_${s.id}` }];
+    });
+    buttons.push([{ text: '🚫 Oprește toate', callback_data: 'stopsearch_all' }]);
+
+    bot.sendMessage(chatId,
+      `🔔 Ai *${subs.length} căutări zilnice* active.\nAlege pe care vrei să o oprești:`,
+      { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } }
+    );
+  });
+
+  // Handle stop search callbacks
+  bot.on('callback_query', (query) => {
+    if (!query.data.startsWith('stopsearch_')) return;
+    const chatId = query.message.chat.id;
+    bot.answerCallbackQuery(query.id);
+
+    if (query.data === 'stopsearch_all') {
+      db.prepare(`UPDATE telegram_subscriptions SET active = 0 WHERE chat_id = ? AND subscription_type = 'daily_search'`).run(chatId);
+      bot.sendMessage(chatId, `🚫 Toate căutările zilnice au fost oprite.`, { parse_mode: 'Markdown' });
+      return;
+    }
+
+    const subId = parseInt(query.data.replace('stopsearch_', ''));
+    db.prepare(`UPDATE telegram_subscriptions SET active = 0 WHERE id = ? AND chat_id = ?`).run(subId, chatId);
+    bot.sendMessage(chatId, `🚫 Căutarea a fost oprită.`, { parse_mode: 'Markdown' });
   });
 
   // ===== /urmareste COMMAND — Start conversation flow =====
@@ -1784,6 +1951,168 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
     return { total: subscribers.length, sent, blocked, failed };
   }
 
+  // ===== DAILY SEARCH OFFERS — send personalized 3 offers to each search subscriber =====
+  async function sendDailySearchOffers() {
+    const subscribers = db.prepare(`SELECT * FROM telegram_subscriptions WHERE subscription_type = 'daily_search' AND active = 1`).all();
+    if (subscribers.length === 0) {
+      console.log('[DailySearch] No active search subscribers, skipping');
+      return { sent: 0, total: 0 };
+    }
+
+    console.log(`[DailySearch] Processing ${subscribers.length} search subscriptions...`);
+
+    const fmtDate = (d) => `${d.getDate().toString().padStart(2, '0')}.${(d.getMonth() + 1).toString().padStart(2, '0')}.${d.getFullYear()}`;
+    let sent = 0, failed = 0, blocked = 0;
+
+    for (const sub of subscribers) {
+      try {
+        const params = JSON.parse(sub.destinations); // destinations stores JSON search params
+        if (!params || !params.countryId) {
+          console.log(`[DailySearch] Invalid params for sub ${sub.id}, skipping`);
+          continue;
+        }
+
+        // Adjust dates: if checkIn is in the past, shift to next 7 days
+        let checkInStr = params.checkIn;
+        let checkToStr = params.checkTo;
+        const now = new Date();
+        if (checkInStr) {
+          const checkInDate = new Date(checkInStr);
+          if (checkInDate < now) {
+            // Shift to next 7 days from today
+            const newCheckIn = new Date(now.getTime() + 3 * 86400000);
+            const newCheckTo = new Date(now.getTime() + 30 * 86400000);
+            checkInStr = fmtDate(newCheckIn);
+            checkToStr = fmtDate(newCheckTo);
+          } else {
+            // Convert to DD.MM.YYYY for Otpusk
+            checkInStr = fmtDate(checkInDate);
+            if (checkToStr) {
+              checkToStr = fmtDate(new Date(checkToStr));
+            } else {
+              checkToStr = fmtDate(new Date(checkInDate.getTime() + 14 * 86400000));
+            }
+          }
+        } else {
+          // No date specified: next 7-30 days
+          const newCheckIn = new Date(now.getTime() + 7 * 86400000);
+          const newCheckTo = new Date(now.getTime() + 30 * 86400000);
+          checkInStr = fmtDate(newCheckIn);
+          checkToStr = fmtDate(newCheckTo);
+        }
+
+        // Find country info for display
+        const country = Object.entries(COUNTRIES).find(([, v]) => v.id === params.countryId);
+        const countryName = country ? country[0].charAt(0).toUpperCase() + country[0].slice(1) : 'Destinație';
+        const flag = country ? country[1].flag : '🏖️';
+
+        const searchParams = {
+          countryId: params.countryId,
+          checkIn: checkInStr,
+          checkTo: checkToStr,
+          length: params.length || '7',
+          people: params.people || '2',
+          transport: params.transport || 'air',
+          deptCity: params.deptCity || '1831',
+          currencyLocal: params.currencyLocal || 'eur',
+        };
+
+        // Add food filter if specified
+        if (params.food) searchParams.food = expandFood(params.food.split(',')[0]);
+        // Add stars filter if specified
+        if (params.stars) searchParams.stars = params.stars;
+
+        const hotelPrices = await searchPricesFn(searchParams);
+        if (!hotelPrices || Object.keys(hotelPrices).length === 0) {
+          console.log(`[DailySearch] No results for sub ${sub.id} (${countryName})`);
+          continue;
+        }
+
+        // Filter by max price if set
+        let sorted = Object.entries(hotelPrices)
+          .map(([id, data]) => ({ id, ...data }))
+          .filter(h => h.price > 0);
+
+        if (params.maxPrice) {
+          sorted = sorted.filter(h => h.price <= params.maxPrice);
+        }
+
+        // Sort by price ascending, take top 3
+        sorted = sorted.sort((a, b) => a.price - b.price).slice(0, 3);
+
+        if (sorted.length === 0) {
+          console.log(`[DailySearch] No matching offers for sub ${sub.id} after filtering`);
+          continue;
+        }
+
+        // Parse adults/children for display
+        const adults = parseInt((params.people || '2').toString()[0]) || 2;
+        let childDesc = '';
+        if (params.people && params.people.length > 1) {
+          const agesStr = params.people.toString().slice(1);
+          const ages = [];
+          for (let i = 0; i < agesStr.length; i += 2) ages.push(parseInt(agesStr.substring(i, i + 2)));
+          if (ages.length > 0) childDesc = ` + copii ${ages.join(', ')} ani`;
+        }
+
+        // Build message (HTML format for bold/links)
+        let text = `🔔 <b>Ofertele tale zilnice — ${flag} ${escHtml(countryName)}</b>\n\n`;
+        text += `📅 ${checkInStr} | 🌙 ${params.length || 7} nopți | 👥 ${adults} pers${childDesc}\n\n`;
+
+        sorted.forEach((offer, i) => {
+          const medal = ['🥇', '🥈', '🥉'][i];
+          const hotelName = offer.name ? escHtml(offer.name).substring(0, 45) : `Hotel #${offer.id}`;
+          const starsText = offer.stars ? ` ⭐${offer.stars}` : '';
+          const ratingText = offer.rating ? ` | 📊${offer.rating}` : '';
+
+          // Build direct link to this hotel on ZebraTur
+          const offerLink = buildZebraturLink({
+            country_id: params.countryId, dept_city_id: params.deptCity || 1831,
+            check_in: params.checkIn || checkInStr, check_to: params.checkTo || checkToStr,
+            nights: parseInt(params.length) || 7, adults,
+            children_ages: childDesc ? params.people.slice(1) : null,
+            stars: params.stars ? parseInt(params.stars) : null,
+            food: params.food, max_price: params.maxPrice, currency: 'eur',
+            transport: params.transport || 'air'
+          });
+
+          text += `${medal} <a href="${offerLink}">${hotelName}</a>${starsText}${ratingText}\n`;
+          text += `   💰 <b>${Math.round(offer.price)} EUR</b>/pers\n\n`;
+        });
+
+        text += `📞 Rezervări: ${AGENCY.phone}`;
+
+        await bot.sendMessage(sub.chat_id, text, {
+          parse_mode: 'HTML',
+          disable_web_page_preview: true,
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '🌐 Caută pe ZebraTur', url: 'https://zebratur.md' }],
+              [{ text: '🚫 Dezabonare', callback_data: `stopsearch_${sub.id}` }]
+            ]
+          }
+        });
+        sent++;
+        // Rate limit between users
+        await new Promise(r => setTimeout(r, 100));
+        // Rate limit between API searches
+        await new Promise(r => setTimeout(r, 2000));
+      } catch (err) {
+        if (err.response?.statusCode === 403) {
+          blocked++;
+          db.prepare(`UPDATE telegram_subscriptions SET active = 0 WHERE id = ?`).run(sub.id);
+          console.log(`[DailySearch] User ${sub.chat_id} blocked bot — unsubscribed`);
+        } else {
+          failed++;
+          console.error(`[DailySearch] Error for sub ${sub.id}:`, err.message);
+        }
+      }
+    }
+
+    console.log(`[DailySearch] Done: ${sent} sent, ${blocked} blocked, ${failed} failed`);
+    return { total: subscribers.length, sent, blocked, failed };
+  }
+
   // ===== RETURN BOT INTERFACE =====
   return {
     bot,
@@ -1793,6 +2122,7 @@ function initTelegramBot(db, searchPricesFn, AGENCY) {
     sendTelegramHotelAlert,
     broadcastMessage,
     sendDailyTopDeals,
+    sendDailySearchOffers,
   };
 }
 
